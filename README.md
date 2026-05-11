@@ -9,7 +9,7 @@ LLM агентам нужна память: факты о проекте, люд
 ## Быстрый старт
 
 ```bash
-pip install knowledge-base-kit
+pip install -e .
 
 # Инициализировать базу
 kbk init --path ./my-knowledge-base
