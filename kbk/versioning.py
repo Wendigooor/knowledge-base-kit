@@ -13,6 +13,7 @@ from typing import Optional
 
 from kbk.document import Document
 from kbk.exceptions import VersioningError
+from kbk.config import KBKConfig
 
 
 class VersionManager:
@@ -22,17 +23,32 @@ class VersionManager:
     `.kbk/versions/` directory, keyed by document ID.
     """
 
-    def __init__(self, versions_dir: Optional[str] = None):
+    def __init__(
+        self,
+        versions_dir: Optional[str] = None,
+        config: Optional[KBKConfig] = None,
+    ):
         """Initialise the version manager.
 
         Args:
             versions_dir: Path to the directory where version snapshots
                           are stored. Defaults to ~/.kbk/versions/.
+            config: KBKConfig instance. If provided and versions_dir is
+                    not given, versions_dir is taken from config.versions_dir.
         """
-        self.versions_dir = Path(
-            versions_dir or Path.home() / ".kbk" / "versions"
-        )
+        if versions_dir is None:
+            if config is not None:
+                versions_dir = config.versions_dir
+            else:
+                versions_dir = str(Path.home() / ".kbk" / "versions")
+        self.versions_dir = Path(versions_dir)
         self.versions_dir.mkdir(parents=True, exist_ok=True)
+
+    def snapshot_count(self) -> int:
+        """Return the total number of snapshot files."""
+        if not self.versions_dir.exists():
+            return 0
+        return len(list(self.versions_dir.glob("*.json")))
 
     def _snapshot_path(self, doc_id: str) -> Path:
         """Return the path to a document's snapshot file."""

@@ -46,6 +46,24 @@ class KBKConfig:
     chroma_settings: dict = field(default_factory=lambda: {
         "anonymized_telemetry": False,
     })
+    # Versioning snapshot storage
+    versions_dir: str = os.path.expanduser("~/.kbk/versions")
+
+    # Default export path
+    export_path: str = os.path.expanduser("~/.kbk/exports")
+
+    @classmethod
+    def load(cls, path: Optional[str] = None) -> "KBKConfig":
+        """Load configuration from file or return defaults.
+
+        Args:
+            path: Explicit path to config file. If None, searches standard locations.
+
+        Returns:
+            KBKConfig instance with loaded or default values.
+        """
+        return load_config(path)
+
 
     @classmethod
     def from_dict(cls, data: dict) -> "KBKConfig":
