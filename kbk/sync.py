@@ -23,6 +23,9 @@ try:
 except ImportError:
     PYGIT2_AVAILABLE = False
 
+import subprocess
+import tempfile
+
 
 class SyncManager:
     """Manages Git-based synchronisation of the knowledge base.

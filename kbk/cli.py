@@ -11,9 +11,26 @@ import click
 
 from kbk.config import KBKConfig
 from kbk.document import Document
+from kbk.exceptions import StoreError, DocumentError, VersioningError, SyncError
 from kbk.store import KnowledgeStore
 from kbk.versioning import VersionManager
 from kbk.sync import SyncManager
+
+
+def _handle_error(func):
+    """Decorator: wrap CLI commands in try/except for domain exceptions."""
+    from functools import wraps
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except (StoreError, DocumentError, VersioningError, SyncError) as e:
+            click.echo(f"❌ {e}", err=True)
+            sys.exit(1)
+        except Exception as e:
+            click.echo(f"❌ Unexpected error: {e}", err=True)
+            sys.exit(1)
+    return wrapper
 
 
 @click.group()
@@ -35,6 +52,7 @@ def cli(ctx: click.Context, config: str | None, path: str | None):
 
 @cli.command()
 @click.pass_context
+@_handle_error
 def init(ctx: click.Context):
     """Initialize a new knowledge base."""
     cfg: KBKConfig = ctx.obj["config"]
@@ -54,6 +72,7 @@ def init(ctx: click.Context):
 @click.option("--tag", "-g", multiple=True, default=None, help="Tags")
 @click.option("--metadata", "-m", default=None, help="JSON metadata")
 @click.pass_context
+@_handle_error
 def add(ctx: click.Context, collection: str, doc_id: str | None, content: str, tag: tuple[str, ...] | None, metadata: str | None):
     """Add a document to the knowledge base."""
     store: KnowledgeStore = ctx.obj["store"]
@@ -85,6 +104,7 @@ def add(ctx: click.Context, collection: str, doc_id: str | None, content: str, t
 @click.option("--collection", "-c", default=None, help="Filter by collection")
 @click.option("--limit", "-n", default=10, help="Max results")
 @click.pass_context
+@_handle_error
 def search(ctx: click.Context, query: str, collection: str | None, limit: int):
     """Search documents by semantic similarity."""
     store: KnowledgeStore = ctx.obj["store"]
@@ -101,6 +121,7 @@ def search(ctx: click.Context, query: str, collection: str | None, limit: int):
 
 @cli.command()
 @click.pass_context
+@_handle_error
 def sync(ctx: click.Context):
     """Synchronize with remote git repository."""
     sync_mgr: SyncManager = ctx.obj["sync"]
@@ -138,6 +159,7 @@ def sync(ctx: click.Context):
 @click.option("--collection", "-c", default=None)
 @click.option("--id", "doc_id", default=None)
 @click.pass_context
+@_handle_error
 def history(ctx: click.Context, collection: str | None, doc_id: str | None):
     """Show version history for documents."""
     versioning: VersionManager = ctx.obj["versioning"]
@@ -161,6 +183,7 @@ def history(ctx: click.Context, collection: str | None, doc_id: str | None):
 @click.option("--id", "doc_id", required=True)
 @click.option("--version", "-v", required=True, type=int)
 @click.pass_context
+@_handle_error
 def rollback(ctx: click.Context, collection: str, doc_id: str, version: int):
     """Rollback a document to a previous version."""
     store: KnowledgeStore = ctx.obj["store"]
@@ -181,6 +204,7 @@ def rollback(ctx: click.Context, collection: str, doc_id: str, version: int):
 
 @cli.command()
 @click.pass_context
+@_handle_error
 def status(ctx: click.Context):
     """Show knowledge base status."""
     store: KnowledgeStore = ctx.obj["store"]
@@ -210,6 +234,7 @@ def status(ctx: click.Context):
 @cli.command()
 @click.option("--export-path", default=None, help="Output path for the exported JSON")
 @click.pass_context
+@_handle_error
 def export(ctx: click.Context, export_path: str | None):
     """Export all documents to JSON."""
     store: KnowledgeStore = ctx.obj["store"]
@@ -221,6 +246,7 @@ def export(ctx: click.Context, export_path: str | None):
 @cli.command()
 @click.option("--seed-file", default=None, help="JSON file to seed from")
 @click.pass_context
+@_handle_error
 def seed(ctx: click.Context, seed_file: str | None):
     """Seed/restore the knowledge base from a JSON export."""
     store: KnowledgeStore = ctx.obj["store"]

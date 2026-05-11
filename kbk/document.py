@@ -40,6 +40,7 @@ class Document:
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
     previous_versions: list[dict] = field(default_factory=list)
+    max_versions: int = 50  # Auto-prune when exceeded
 
     def __post_init__(self) -> None:
         """Validate document fields after initialisation."""
@@ -80,6 +81,10 @@ class Document:
             "updated_at": self.updated_at,
         }
         self.previous_versions.append(snapshot)
+        # Auto-prune: keep only most recent max_versions
+        if len(self.previous_versions) > self.max_versions:
+            excess = len(self.previous_versions) - self.max_versions
+            self.previous_versions = self.previous_versions[excess:]
 
         if content is not None:
             self.content = content
