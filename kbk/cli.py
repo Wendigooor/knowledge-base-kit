@@ -1,5 +1,4 @@
-"""CLI for Knowledge Base Kit."""
-
+"""CLI for Knowledge Base Kit v2 — Enterprise Semantic Index."""
 from __future__ import annotations
 
 import json
@@ -10,21 +9,19 @@ from pathlib import Path
 import click
 
 from kbk.config import KBKConfig
-from kbk.document import Document
-from kbk.exceptions import StoreError, DocumentError, VersioningError, SyncError
+from kbk.document import IndexedDocument
+from kbk.exceptions import StoreError, DocumentError
 from kbk.store import KnowledgeStore
-from kbk.versioning import VersionManager
-from kbk.sync import SyncManager
+from kbk.indexer import Indexer
 
 
 def _handle_error(func):
-    """Decorator: wrap CLI commands in try/except for domain exceptions."""
     from functools import wraps
     @wraps(func)
     def wrapper(*args, **kwargs):
         try:
             return func(*args, **kwargs)
-        except (StoreError, DocumentError, VersioningError, SyncError) as e:
+        except (StoreError, DocumentError) as e:
             click.echo(f"❌ {e}", err=True)
             sys.exit(1)
         except Exception as e:
@@ -38,65 +35,52 @@ def _handle_error(func):
 @click.option("--path", "-p", default=None, help="Knowledge base root path")
 @click.pass_context
 def cli(ctx: click.Context, config: str | None, path: str | None):
-    """Knowledge Base Kit — vector knowledge base with versioning and sync."""
+    """KBK — Enterprise Semantic Index. От index/1v1."""
     ctx.ensure_object(dict)
     cfg = KBKConfig.load(config) if config else KBKConfig()
     if path:
         cfg.db_path = path
-        cfg.export_path = os.path.join(path, "exports")
     ctx.obj["config"] = cfg
     ctx.obj["store"] = KnowledgeStore(cfg)
-    ctx.obj["versioning"] = VersionManager(config=cfg)
-    ctx.obj["sync"] = SyncManager(cfg)
+    ctx.obj["indexer"] = Indexer(ctx.obj["store"])
 
 
 @cli.command()
 @click.pass_context
 @_handle_error
 def init(ctx: click.Context):
-    """Initialize a new knowledge base."""
+    """Initialize the semantic index."""
     cfg: KBKConfig = ctx.obj["config"]
     store: KnowledgeStore = ctx.obj["store"]
-    sync_mgr: SyncManager = ctx.obj["sync"]
     os.makedirs(cfg.db_path, exist_ok=True)
-    os.makedirs(cfg.export_path, exist_ok=True)
     store._init_client()
-    sync_mgr._get_or_init_repo()
-    click.echo(f"✅ Knowledge base initialized at {cfg.db_path}")
+    click.echo(f"✅ Knowledge index initialized at {cfg.db_path}")
 
 
 @cli.command()
-@click.option("--collection", "-c", default="default", help="Collection name")
-@click.option("--id", "doc_id", default=None, help="Document ID (auto-generated if not set)")
-@click.option("--content", "-t", required=True, help="Document content")
-@click.option("--tag", "-g", multiple=True, default=None, help="Tags")
-@click.option("--metadata", "-m", default=None, help="JSON metadata")
+@click.option("--text", "-t", required=True, help="Raw text content or URL")
+@click.option("--source", "-s", default="manual", help="Source type: confluence|jira|git|manual")
+@click.option("--url", "-u", default="", help="Source URL")
+@click.option("--collection", "-c", default="unclassified", help="Target collection")
+@click.option("--tag", "-g", multiple=True, help="Tags (optional)")
 @click.pass_context
 @_handle_error
-def add(ctx: click.Context, collection: str, doc_id: str | None, content: str, tag: tuple[str, ...] | None, metadata: str | None):
-    """Add a document to the knowledge base."""
-    store: KnowledgeStore = ctx.obj["store"]
-    versioning: VersionManager = ctx.obj["versioning"]
+def index(ctx: click.Context, text: str, source: str, url: str,
+          collection: str, tag: tuple[str, ...]):
+    """Index a document: clean → summarize → classify → embed → store."""
+    indexer: Indexer = ctx.obj["indexer"]
+    metadata = {"source_type": source, "source_url": url or "manual://" + text[:40]}
+    if tag:
+        metadata["manual_tags"] = list(tag)
 
-    meta = {}
-    if metadata:
-        try:
-            meta = json.loads(metadata)
-        except json.JSONDecodeError:
-            click.echo("❌ Invalid JSON metadata", err=True)
-            sys.exit(1)
-
-    doc = Document(
-        id=doc_id or os.urandom(8).hex(),
-        version=1,
-        tags=list(tag) if tag else [],
-        metadata=meta,
-        content=content,
+    doc = indexer.index(
+        raw_text=text,
+        source_url=metadata["source_url"],
+        source_type=source,
         collection=collection,
+        metadata=metadata,
     )
-    store.add(doc)
-    versioning.save_snapshot(doc)
-    click.echo(f"✅ Added document {doc.id} to '{collection}'")
+    click.echo(f"✅ Indexed {doc.id} → {collection} [{', '.join(doc.tags[:5])}]")
 
 
 @cli.command()
@@ -106,181 +90,82 @@ def add(ctx: click.Context, collection: str, doc_id: str | None, content: str, t
 @click.pass_context
 @_handle_error
 def search(ctx: click.Context, query: str, collection: str | None, limit: int):
-    """Search documents by semantic similarity."""
+    """Semantic search across the index."""
     store: KnowledgeStore = ctx.obj["store"]
     results = store.search(query, n_results=limit, collection_filter=collection)
     if not results:
         click.echo("No results found.")
         return
     for doc in results:
-        tags = f" [{', '.join(doc.tags)}]" if doc.tags else ""
-        click.echo(f"  [{doc.collection}] {doc.id} v{doc.version}{tags}")
-        click.echo(f"    {doc.content[:150]}..." if len(doc.content) > 150 else f"    {doc.content}")
+        tags = f" [{', '.join(doc.tags[:3])}]" if doc.tags else ""
+        click.echo(f"  [{doc.collection}] {doc.id}{tags}")
+        click.echo(f"    {doc.summary[:200]}..." if len(doc.summary) > 200 else f"    {doc.summary}")
+        click.echo(f"    🔗 {doc.source_url}")
         click.echo()
 
 
 @cli.command()
 @click.pass_context
 @_handle_error
-def sync(ctx: click.Context):
-    """Synchronize with remote git repository."""
-    sync_mgr: SyncManager = ctx.obj["sync"]
-    store: KnowledgeStore = ctx.obj["store"]
-    cfg: KBKConfig = ctx.obj["config"]
-
-    # Export all documents to JSON
-    all_docs = []
-    for col in store.list_collections():
-        all_docs.extend(store.list_documents(collection=col, limit=999999))
-    store.export_to_json(os.path.join(cfg.export_path, "chromadb-export.json"))
-    push_result = sync_mgr.push_to_git(all_docs)
-    
-    # Pull remote changes
-    pulled = sync_mgr.pull_from_git()
-    
-    # Import remote documents that don't conflict
-    conflicts = []
-    for doc in pulled:
-        try:
-            store.add(doc)
-        except ValueError as e:
-            conflicts.append({"doc": doc, "error": str(e)})
-    
-    if conflicts:
-        click.echo(f"⚠️  {len(conflicts)} conflict(s) detected:")
-        for c in conflicts:
-            click.echo(f"  ❌ {c['doc'].id}: {c['error']}")
-        click.echo("  Run 'kbk sync --resolve' to auto-resolve")
-    else:
-        click.echo("✅ Sync complete")
-
-
-@cli.command()
-@click.option("--collection", "-c", default=None)
-@click.option("--id", "doc_id", default=None)
-@click.pass_context
-@_handle_error
-def history(ctx: click.Context, collection: str | None, doc_id: str | None):
-    """Show version history for documents."""
-    versioning: VersionManager = ctx.obj["versioning"]
-    if doc_id:
-        try:
-            history = versioning.get_history(doc_id)
-            if not history:
-                click.echo("No history found.")
-                return
-            click.echo(f"History for {doc_id}:")
-            for h in history:
-                click.echo(f"  v{h['version']} — {h.get('updated_at', h.get('created_at', '?'))}")
-        except Exception as e:
-            click.echo(f"❌ {e}")
-    else:
-        click.echo("Use: kbk history --id <doc-id>")
-
-
-@cli.command()
-@click.option("--collection", "-c", required=True)
-@click.option("--id", "doc_id", required=True)
-@click.option("--version", "-v", required=True, type=int)
-@click.pass_context
-@_handle_error
-def rollback(ctx: click.Context, collection: str, doc_id: str, version: int):
-    """Rollback a document to a previous version."""
-    store: KnowledgeStore = ctx.obj["store"]
-    versioning: VersionManager = ctx.obj["versioning"]
-
-    doc = store.get(doc_id, collection)
-    if doc is None:
-        click.echo(f"❌ Document {collection}/{doc_id} not found")
-        return
-
-    restored = versioning.rollback(doc, version)
-    if restored:
-        store.update(restored)
-        click.echo(f"✅ Rolled back {collection}/{doc_id} to v{version}")
-    else:
-        click.echo(f"❌ Version {version} not found for {collection}/{doc_id}")
-
-
-@cli.command()
-@click.pass_context
-@_handle_error
 def status(ctx: click.Context):
-    """Show knowledge base status."""
+    """Show semantic index status."""
     store: KnowledgeStore = ctx.obj["store"]
-    sync_mgr: SyncManager = ctx.obj["sync"]
-    versioning: VersionManager = ctx.obj["versioning"]
     cfg: KBKConfig = ctx.obj["config"]
 
-    click.echo("📊 Knowledge Base Status")
+    stats = store.get_stats()
+    click.echo("📊 Knowledge Index Status")
     click.echo(f"  Path: {cfg.db_path}")
     click.echo(f"  Collections:")
-    for col in store.list_collections():
-        click.echo(f"    📁 {col}: {store.count(col)} docs")
+    if stats["total"] == 0:
+        click.echo("    (empty — run 'kbk index' to add documents)")
+    for col, cnt in stats["collections"].items():
+        click.echo(f"    📁 {col}: {cnt} docs")
+    click.echo(f"  Total: {stats['total']} documents")
 
-    click.echo(f"  Git repo: {'✅ synced' if sync_mgr._get_or_init_repo() else '❌ not initialized'}")
-    click.echo(f"  Snapshot count: {versioning.snapshot_count()}")
-    
     # Check export freshness
-    export_path = os.path.join(cfg.export_path, "chromadb-export.json")
+    export_path = os.path.join(cfg.export_path, "index-stats.json")
     if os.path.exists(export_path):
-        mtime = os.path.getmtime(export_path)
         from datetime import datetime
-        click.echo(f"  Last export: {datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M')}")
+        mtime = os.path.getmtime(export_path)
+        click.echo(f"  Last stats export: {datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M')}")
     else:
-        click.echo("  Last export: never")
+        click.echo("  Last stats export: never")
 
 
 @cli.command()
-@click.option("--export-path", default=None, help="Output path for the exported JSON")
+@click.option("--source", "-s", default=None, help="Filter by source type")
 @click.pass_context
 @_handle_error
-def export(ctx: click.Context, export_path: str | None):
-    """Export all documents to JSON."""
-    store: KnowledgeStore = ctx.obj["store"]
-    path = export_path or os.path.join(ctx.obj["config"].export_path, "chromadb-export.json")
-    count = store.export_to_json(path)
-    click.echo(f"✅ Exported {count} documents to {path}")
+def connectors(ctx: click.Context, source: str | None):
+    """List and manage source connectors."""
+    conn_dir = Path(__file__).parent / "connectors"
+    files = list(conn_dir.glob("*.py"))
+    available = [f.stem for f in files if f.stem != "__init__"]
+
+    click.echo("🔌 Available Connectors")
+    if not available:
+        click.echo("  No connectors installed.")
+        click.echo("  Connectors available: confluence, jira, gitlab, slack")
+        click.echo("  Install with: pip install kbk-[connector-name]")
+        return
+
+    for name in available:
+        active = "✅" if source is None or source == name else "  "
+        click.echo(f"  {active} {name}")
 
 
 @cli.command()
-@click.option("--seed-file", default=None, help="JSON file to seed from")
 @click.pass_context
 @_handle_error
-def seed(ctx: click.Context, seed_file: str | None):
-    """Seed/restore the knowledge base from a JSON export."""
-    store: KnowledgeStore = ctx.obj["store"]
-    path = seed_file or os.path.join(ctx.obj["config"].export_path, "chromadb-export.json")
-    if not os.path.exists(path):
-        click.echo(f"❌ Seed file not found: {path}", err=True)
-        sys.exit(1)
-    with open(path) as f:
-        data = json.load(f)
-    # data is {exported_at: str, collections: {name: [...]}}
-    total = 0
-    for col_name, docs in data.get("collections", data.items()):
-        if col_name == "exported_at":
-            continue
-        if not isinstance(docs, list):
-            continue
-        for doc_data in docs:
-            if isinstance(doc_data, dict) and "content" in doc_data:
-                doc = Document(
-                    id=doc_data.get("id", os.urandom(8).hex()),
-                    version=doc_data.get("version", 1),
-                    tags=doc_data.get("tags", []),
-                    metadata=doc_data.get("metadata", {}),
-                    content=doc_data["content"],
-                    collection=doc_data.get("collection", col_name),
-                    created_at=doc_data.get("created_at", ""),
-                    updated_at=doc_data.get("updated_at", ""),
-                )
-                try:
-                    store.add(doc)
-                    total += 1
-                except Exception:
-                    pass
-    click.echo(f"✅ Seeded {total} documents from {path}")
+def explore(ctx: click.Context):
+    """Open the Read-Only knowledge space (Confluence/Backstage)."""
+    click.echo("📖 Knowledge Space")
+    click.echo("  Read-Only Confluence space: https://confluence.softswiss.com/spaces/KBK")
+    click.echo("  Or run: kbk search <query>")
+    click.echo()
+    click.echo("  Structure:")
+    for col in ["architecture", "infrastructure", "business", "runbooks", "decisions", "team"]:
+        click.echo(f"    📁 {col.capitalize()}")
 
 
 if __name__ == "__main__":

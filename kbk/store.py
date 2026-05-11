@@ -1,8 +1,4 @@
-"""Storage backend for Knowledge Base Kit.
-
-Uses ChromaDB as the persistent vector store for documents.
-"""
-
+"""ChromaDB-backed semantic index store for KBK v2."""
 from __future__ import annotations
 
 import json
@@ -13,34 +9,32 @@ from typing import Optional
 
 import chromadb
 from chromadb.config import Settings as ChromaSettings
+
+from kbk.config import KBKConfig
+from kbk.document import IndexedDocument
+from kbk.exceptions import StoreError
+
 # WhereFilter type — use dict for newer ChromaDB versions
 WhereFilter = dict
 
-from kbk.config import KBKConfig
-from kbk.document import Document
-from kbk.exceptions import DocumentError, StoreError
-
 
 class KnowledgeStore:
-    """ChromaDB-backed document store.
+    """ChromaDB-backed semantic index.
 
-    Manages document CRUD with automatic metadata indexing.
-    Each collection in ChromaDB corresponds to a logical document group.
+    Stores vectors + metadata for each indexed document.
+    Does NOT store full content — only LLM-generated summary + source pointers.
     """
 
     def __init__(self, config: Optional[KBKConfig] = None):
-        """Initialise store with optional config.
-
-        Args:
-            config: KBKConfig instance. Falls back to defaults if omitted.
-        """
         self.config = config or KBKConfig()
         self._client: Optional[chromadb.PersistentClient] = None
         self._collections: dict[str, chromadb.Collection] = {}
 
+    def _init_client(self) -> None:
+        _ = self.client
+
     @property
     def client(self) -> chromadb.PersistentClient:
-        """Lazy-initialised ChromaDB persistent client."""
         if self._client is None:
             db_path = Path(self.config.db_path)
             db_path.mkdir(parents=True, exist_ok=True)
@@ -51,15 +45,13 @@ class KnowledgeStore:
             )
             try:
                 self._client = chromadb.PersistentClient(
-                    path=str(db_path),
-                    settings=settings,
+                    path=str(db_path), settings=settings,
                 )
             except Exception as exc:
                 raise StoreError(f"Failed to initialise ChromaDB: {exc}") from exc
         return self._client
 
     def _get_collection(self, name: str) -> chromadb.Collection:
-        """Get or create a ChromaDB collection by name."""
         if name not in self._collections:
             try:
                 self._collections[name] = self.client.get_or_create_collection(name)
@@ -69,139 +61,50 @@ class KnowledgeStore:
                 ) from exc
         return self._collections[name]
 
-    def _init_client(self) -> None:
-        """Initialize the ChromaDB client (lazy)."""
-        _ = self.client
-
-    @staticmethod
-    def _doc_to_chroma_data(doc: Document) -> tuple[str, str, dict]:
-        """Convert a Document to ChromaDB add/update format."""
+    def upsert(self, doc: IndexedDocument) -> str:
+        """Insert or update a document in the index.
+        
+        If a document with the same ID exists, it is overwritten.
+        """
+        collection = self._get_collection(doc.collection)
         metadata = {
             "doc_id": doc.id,
-            "version": doc.version,
             "tags": json.dumps(doc.tags, ensure_ascii=False),
+            "summary": doc.summary,
+            "source_url": doc.source_url,
+            "source_type": doc.source_type,
             "collection": doc.collection,
             "created_at": doc.created_at,
             "updated_at": doc.updated_at,
+            "chunk_count": doc.chunk_count,
         }
-        # Store user metadata under a special key
         if doc.metadata:
             metadata["user_metadata"] = json.dumps(doc.metadata, ensure_ascii=False)
-        return doc.id, doc.content, metadata
-
-    @staticmethod
-    def _chroma_to_doc(
-        chroma_id: str,
-        content: str,
-        metadata: dict,
-    ) -> Document:
-        """Reconstruct a Document from ChromaDB query results."""
-        tags_raw = metadata.get("tags", "[]")
-        if isinstance(tags_raw, str):
-            tags = json.loads(tags_raw)
-        else:
-            tags = list(tags_raw) if tags_raw else []
-
-        user_meta_raw = metadata.get("user_metadata", "{}")
-        if isinstance(user_meta_raw, str):
-            user_meta = json.loads(user_meta_raw)
-        else:
-            user_meta = dict(user_meta_raw) if user_meta_raw else {}
-
-        return Document(
-            id=metadata.get("doc_id", chroma_id),
-            version=metadata.get("version", 1),
-            tags=tags,
-            metadata=user_meta,
-            content=content or "",
-            collection=metadata.get("collection", "default"),
-            created_at=metadata.get("created_at", ""),
-            updated_at=metadata.get("updated_at", ""),
-        )
-
-    def add(self, document: Document) -> str:
-        """Add a document to the store.
-
-        Args:
-            document: Document instance to store.
-
-        Returns:
-            The document ID.
-
-        Raises:
-            DocumentError: If document content is empty.
-            StoreError: On ChromaDB failure.
-        """
-        if not document.content.strip():
-            raise DocumentError("Document content cannot be empty")
-
-        collection = self._get_collection(document.collection)
-        doc_id, content, metadata = self._doc_to_chroma_data(document)
 
         try:
-            collection.add(
-                ids=[doc_id],
-                documents=[content],
+            collection.upsert(
+                ids=[doc.id],
+                documents=[doc.summary],
                 metadatas=[metadata],
             )
         except Exception as exc:
-            raise StoreError(f"Failed to add document: {exc}") from exc
+            raise StoreError(f"Failed to upsert document: {exc}") from exc
+        return doc.id
 
-        return doc_id
-
-    def get(self, doc_id: str, collection: str = "default") -> Optional[Document]:
-        """Retrieve a single document by ID.
-
-        Args:
-            doc_id: UUID of the document.
-            collection: Collection name.
-
-        Returns:
-            Document if found, None otherwise.
-        """
+    def get(self, doc_id: str, collection: str = "default") -> Optional[IndexedDocument]:
         try:
             col = self._get_collection(collection)
             results = col.get(ids=[doc_id])
         except Exception:
             return None
-
         if not results or not results["ids"]:
             return None
-
-        return self._chroma_to_doc(
-            chroma_id=results["ids"][0],
-            content=results["documents"][0] if results.get("documents") else "",
-            metadata=results["metadatas"][0] if results.get("metadatas") else {},
+        return self._meta_to_doc(
+            results["ids"][0],
+            results["metadatas"][0] if results.get("metadatas") else {},
         )
 
-    def update(self, document: Document) -> None:
-        """Update an existing document in the store.
-
-        Args:
-            document: Document with updated fields.
-        """
-        collection = self._get_collection(document.collection)
-        doc_id, content, metadata = self._doc_to_chroma_data(document)
-
-        try:
-            collection.update(
-                ids=[doc_id],
-                documents=[content],
-                metadatas=[metadata],
-            )
-        except Exception as exc:
-            raise StoreError(f"Failed to update document: {exc}") from exc
-
     def delete(self, doc_id: str, collection: str = "default") -> bool:
-        """Delete a document by ID.
-
-        Args:
-            doc_id: UUID of the document.
-            collection: Collection name.
-
-        Returns:
-            True if deleted, False if not found.
-        """
         try:
             col = self._get_collection(collection)
             existing = col.get(ids=[doc_id])
@@ -212,57 +115,16 @@ class KnowledgeStore:
         except Exception:
             return False
 
-    def export_to_json(self, path: str) -> int:
-        """Export all documents from all collections to a JSON file.
-
-        Args:
-            path: Output JSON file path.
-
-        Returns:
-            Number of documents exported.
-        """
-        collections = self.list_collections()
-        export_data = {
-            "exported_at": datetime.now(timezone.utc).isoformat(),
-            "collections": {},
-        }
-        total = 0
-        for col_name in collections:
-            docs = self.list_documents(collection=col_name, limit=999999)
-            export_data["collections"][col_name] = [
-                doc.to_dict() for doc in docs
-            ]
-            total += len(docs)
-
-        path_obj = Path(path)
-        path_obj.parent.mkdir(parents=True, exist_ok=True)
-        path_obj.write_text(
-            json.dumps(export_data, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        return total
-
     def search(
         self,
         query: str,
         n_results: Optional[int] = None,
         collection_filter: Optional[str] = None,
         filters: Optional[dict] = None,
-    ) -> list[Document]:
-        """Semantic search over documents.
-
-        Args:
-            query: Natural language query string.
-            n_results: Number of results (default from config).
-            collection_filter: Collection name to search in (default from config).
-            filters: Optional metadata filters.
-
-        Returns:
-            List of Document instances sorted by relevance.
-        """
+    ) -> list[IndexedDocument]:
         n_results = n_results or self.config.top_k
-        collection = collection_filter or self.config.default_collection
-        col = self._get_collection(collection)
+        collection_name = collection_filter or self.config.default_collection
+        col = self._get_collection(collection_name)
 
         where_filter: Optional[WhereFilter] = None
         if filters:
@@ -285,60 +147,36 @@ class KnowledgeStore:
         if not results or not results["ids"]:
             return []
 
-        documents = []
+        docs = []
         for i in range(len(results["ids"][0])):
-            doc = self._chroma_to_doc(
-                chroma_id=results["ids"][0][i],
-                content=results["documents"][0][i] if results.get("documents") else "",
-                metadata=results["metadatas"][0][i] if results.get("metadatas") else {},
-            )
-            documents.append(doc)
+            docs.append(self._meta_to_doc(
+                results["ids"][0][i],
+                results["metadatas"][0][i] if results.get("metadatas") else {},
+            ))
+        return docs
 
-        return documents
-
-    def list_documents(
-        self,
-        collection: str = "default",
-        limit: int = 100,
-        offset: int = 0,
-    ) -> list[Document]:
-        """List documents in a collection with pagination.
-
-        Args:
-            collection: Collection name.
-            limit: Max number of documents.
-            offset: Number of documents to skip.
-
-        Returns:
-            List of Document instances.
-        """
+    def list_documents(self, collection: str = "default", limit: int = 100,
+                       offset: int = 0) -> list[IndexedDocument]:
         col = self._get_collection(collection)
         try:
             results = col.get(limit=limit, offset=offset)
         except Exception as exc:
             raise StoreError(f"Failed to list documents: {exc}") from exc
-
         if not results or not results["ids"]:
             return []
-
         docs = []
         for i in range(len(results["ids"])):
-            docs.append(
-                self._chroma_to_doc(
-                    chroma_id=results["ids"][i],
-                    content=results["documents"][i] if results.get("documents") else "",
-                    metadata=results["metadatas"][i] if results.get("metadatas") else {},
-                )
-            )
+            docs.append(self._meta_to_doc(
+                results["ids"][i],
+                results["metadatas"][i] if results.get("metadatas") else {},
+            ))
         return docs
 
     def count(self, collection: str = "default") -> int:
-        """Get the number of documents in a collection."""
         col = self._get_collection(collection)
         return col.count()
 
     def list_collections(self) -> list[str]:
-        """List all collection names in the store."""
         try:
             collections = self.client.list_collections()
             return [c.name for c in collections]
@@ -346,9 +184,34 @@ class KnowledgeStore:
             raise StoreError(f"Failed to list collections: {exc}") from exc
 
     def delete_collection(self, name: str) -> None:
-        """Delete an entire collection and all its documents."""
         try:
             self.client.delete_collection(name)
             self._collections.pop(name, None)
         except Exception as exc:
             raise StoreError(f"Failed to delete collection '{name}': {exc}") from exc
+
+    def get_stats(self) -> dict:
+        """Return index statistics: doc count per collection + total."""
+        cols = self.list_collections()
+        stats = {"collections": {}, "total": 0}
+        for c in cols:
+            cnt = self.count(c)
+            stats["collections"][c] = cnt
+            stats["total"] += cnt
+        return stats
+
+    @staticmethod
+    def _meta_to_doc(chroma_id: str, metadata: dict) -> IndexedDocument:
+        tags_raw = metadata.get("tags", "[]")
+        tags = json.loads(tags_raw) if isinstance(tags_raw, str) else (list(tags_raw) if tags_raw else [])
+
+        return IndexedDocument(
+            id=metadata.get("doc_id", chroma_id),
+            summary=metadata.get("summary", ""),
+            tags=tags,
+            metadata={"source_url": metadata.get("source_url", ""), "source_type": metadata.get("source_type", "unknown")},
+            collection=metadata.get("collection", "unclassified"),
+            created_at=metadata.get("created_at", ""),
+            updated_at=metadata.get("updated_at", ""),
+            chunk_count=metadata.get("chunk_count", 0),
+        )

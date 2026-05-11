@@ -1,51 +1,38 @@
-"""Smoke tests for Knowledge Base Kit."""
+"""Smoke tests for KBK v2 — Enterprise Semantic Index."""
 import os
 import sys
 import tempfile
-import json
 from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from kbk.document import Document
+from kbk.document import IndexedDocument
 from kbk.config import KBKConfig
 from kbk.store import KnowledgeStore
-from kbk.versioning import VersionManager
-from kbk.exceptions import DocumentError
+from kbk.indexer import Indexer
 
 
 def test_document_create():
-    doc = Document(content="Hello", tags=["test"])
+    doc = IndexedDocument(summary="API Gateway on K8s", tags=["architecture", "k8s"])
     assert doc.id
-    assert doc.version == 1
-    assert doc.content == "Hello"
-    assert doc.tags == ["test"]
-    print("✅ Document create")
+    assert doc.summary == "API Gateway on K8s"
+    assert "k8s" in doc.tags
+    print("✅ IndexedDocument create")
 
 
-def test_document_update():
-    doc = Document(content="v1", tags=["a"])
-    doc.update(content="v2", tags=["a", "b"])
-    assert doc.version == 2
-    assert doc.content == "v2"
-    assert len(doc.previous_versions) == 1
-    print("✅ Document update")
+def test_document_source_url():
+    doc = IndexedDocument(metadata={"source_url": "https://confluence/page/123"})
+    assert doc.source_url == "https://confluence/page/123"
+    print("✅ IndexedDocument source_url")
 
 
-def test_document_auto_prune():
-    doc = Document(content="base", max_versions=3)
-    for i in range(5):
-        doc.update(content=f"v{i}")
-    assert len(doc.previous_versions) <= 3
-    assert doc.version == 6
-    print("✅ Document auto-prune")
-
-
-def test_document_empty_content():
-    # Content can be empty at Document level — store.add() validates it
-    doc = Document(content="")
-    assert doc.content == ""
-    print("✅ Document empty content allowed (validated at store level)")
+def test_document_from_dict():
+    data = {"id": "abc123", "summary": "test", "tags": ["a"], "collection": "arch"}
+    doc = IndexedDocument.from_dict(data)
+    assert doc.id == "abc123"
+    assert doc.summary == "test"
+    assert doc.collection == "arch"
+    print("✅ IndexedDocument from_dict")
 
 
 def test_store_init():
@@ -57,82 +44,107 @@ def test_store_init():
     print("✅ Store init")
 
 
-def test_store_crud():
-    with tempfile.TemporaryDirectory() as tmp:
-        cfg = KBKConfig(db_path=tmp)
-        store = KnowledgeStore(cfg)
-        doc = Document(content="Test content", tags=["smoke"], collection="smoke")
-        doc_id = store.add(doc)
-        assert doc_id == doc.id
-
-        retrieved = store.get(doc_id, "smoke")
-        assert retrieved is not None
-        assert retrieved.content == "Test content"
-
-        docs = store.list_documents("smoke")
-        assert len(docs) == 1
-
-        count = store.count("smoke")
-        assert count == 1
-    print("✅ Store CRUD")
-
-
-def test_store_search():
+def test_store_upsert_and_search():
     with tempfile.TemporaryDirectory() as tmp:
         cfg = KBKConfig(db_path=tmp, top_k=5)
         store = KnowledgeStore(cfg)
-        store.add(Document(content="Python programming", collection="dev"))
-        store.add(Document(content="JavaScript programming", collection="dev"))
-        results = store.search("Python", collection_filter="dev")
-        assert len(results) > 0
-    print("✅ Store search")
+        doc = IndexedDocument(summary="PostgreSQL migration guide", tags=["db", "postgres"], collection="arch")
+        store.upsert(doc)
+        assert store.count("arch") == 1
+        results = store.search("postgres", collection_filter="arch")
+        assert len(results) >= 1
+        assert results[0].summary == doc.summary
+    print("✅ Store upsert & search")
 
 
-def test_store_export():
+def test_store_get():
     with tempfile.TemporaryDirectory() as tmp:
         cfg = KBKConfig(db_path=tmp)
         store = KnowledgeStore(cfg)
-        store.add(Document(content="Doc 1", collection="test"))
-        export_path = os.path.join(tmp, "export.json")
-        count = store.export_to_json(export_path)
-        assert count == 1
-        assert os.path.exists(export_path)
-    print("✅ Store export")
+        doc = IndexedDocument(summary="Test doc", collection="test")
+        store.upsert(doc)
+        retrieved = store.get(doc.id, "test")
+        assert retrieved is not None
+        assert retrieved.summary == "Test doc"
+    print("✅ Store get")
 
 
-def test_versioning_save_history():
+def test_store_delete():
     with tempfile.TemporaryDirectory() as tmp:
-        vm = VersionManager(versions_dir=tmp)
-        doc = Document(content="v1", id="test-doc")
-        vm.save_snapshot(doc)
-        doc.update(content="v2")
-        vm.save_snapshot(doc)
-        history = vm.get_history("test-doc")
-        assert len(history) >= 2
-    print("✅ Versioning save & history")
+        cfg = KBKConfig(db_path=tmp)
+        store = KnowledgeStore(cfg)
+        doc = IndexedDocument(summary="Delete me", collection="test")
+        store.upsert(doc)
+        assert store.delete(doc.id, "test") is True
+        assert store.count("test") == 0
+    print("✅ Store delete")
 
 
-def test_versioning_snapshot_count():
+def test_store_stats():
     with tempfile.TemporaryDirectory() as tmp:
-        vm = VersionManager(versions_dir=tmp)
-        assert vm.snapshot_count() == 0
-        vm.save_snapshot(Document(content="test", id="d1"))
-        assert vm.snapshot_count() == 1
-    print("✅ Versioning snapshot count")
+        cfg = KBKConfig(db_path=tmp)
+        store = KnowledgeStore(cfg)
+        stats = store.get_stats()
+        assert "collections" in stats
+        assert "total" in stats
+        assert stats["total"] == 0
+        doc = IndexedDocument(summary="Doc 1", collection="arch")
+        store.upsert(doc)
+        stats = store.get_stats()
+        assert stats["total"] == 1
+    print("✅ Store stats")
+
+
+def test_indexer_clean():
+    store = KnowledgeStore(KBKConfig(db_path="/tmp/_kbk_test_indexer"))
+    indexer = Indexer(store)
+    cleaned = indexer._clean("<html><body><p>Hello</p></body></html>")
+    assert "Hello" in cleaned
+    assert "<html>" not in cleaned
+    print("✅ Indexer clean")
+
+
+def test_indexer_chunk():
+    store = KnowledgeStore(KBKConfig(db_path="/tmp/_kbk_test_indexer_chunk"))
+    indexer = Indexer(store)
+    text = "word " * 2000
+    chunks = indexer._chunk(text, chunk_size=512)
+    assert len(chunks) >= 3
+    print("✅ Indexer chunk")
+
+
+def test_indexer_full_flow():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = KBKConfig(db_path=tmp)
+        store = KnowledgeStore(cfg)
+        indexer = Indexer(store)
+        doc = indexer.index(
+            raw_text="<h1>API Gateway Migration</h1><p>Moving to K8s for scalability</p>",
+            source_url="https://confluence/page/123",
+            source_type="confluence",
+            collection="architecture",
+        )
+        assert doc.id
+        assert "API" in doc.summary or "Migration" in doc.summary
+        assert doc.source_url == "https://confluence/page/123"
+        assert doc.source_type == "confluence"
+        assert store.count("architecture") == 1
+    print("✅ Indexer full flow")
 
 
 if __name__ == "__main__":
     tests = [
         test_document_create,
-        test_document_update,
-        test_document_auto_prune,
-        test_document_empty_content,
+        test_document_source_url,
+        test_document_from_dict,
         test_store_init,
-        test_store_crud,
-        test_store_search,
-        test_store_export,
-        test_versioning_save_history,
-        test_versioning_snapshot_count,
+        test_store_upsert_and_search,
+        test_store_get,
+        test_store_delete,
+        test_store_stats,
+        test_indexer_clean,
+        test_indexer_chunk,
+        test_indexer_full_flow,
     ]
     passed = 0
     for t in tests:

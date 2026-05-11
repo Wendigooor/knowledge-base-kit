@@ -1,151 +1,85 @@
-"""Document model for Knowledge Base Kit.
-
-Defines the Document dataclass used throughout the system.
-"""
-
+"""Document model for Knowledge Base Kit v2 — Enterprise Semantic Index."""
 from __future__ import annotations
 
-import uuid
+import hashlib
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
 
 @dataclass
-class Document:
-    """Represents a single knowledge document.
+class IndexedDocument:
+    """Represents an indexed document from an external source.
+
+    KBK does NOT store full content. It stores an LLM-generated summary
+    plus metadata pointing to the original source (Confluence, Jira, Git, etc.).
 
     Attributes:
-        id: Unique document identifier.
-        version: Current version number (starts at 1).
-        tags: List of tags for categorisation.
-        metadata: Arbitrary key-value metadata.
-        content: The main text content of the document.
-        collection: Name of the ChromaDB collection this doc belongs to.
-        created_at: ISO-8601 timestamp of creation.
-        updated_at: ISO-8601 timestamp of last update.
-        previous_versions: Ordered list of historical snapshots.
+        id: Hash of source_url + source_version (immutable identifier).
+        summary: LLM-generated summary (100-200 tokens) of the original content.
+        tags: LLM-classified tags for categorization.
+        metadata: source_url, source_type, access_group, original_title.
+        collection: Logical group — architecture | infrastructure | business | runbooks.
+        created_at: When first indexed.
+        updated_at: When last updated in the original source.
+        chunk_count: Number of vector chunks in ChromaDB.
     """
-
-    id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    version: int = 1
+    id: str = ""
+    summary: str = ""
     tags: list[str] = field(default_factory=list)
     metadata: dict = field(default_factory=dict)
-    content: str = ""
-    collection: str = "default"
+    collection: str = "unclassified"
     created_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
     updated_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
-    previous_versions: list[dict] = field(default_factory=list)
-    max_versions: int = 50  # Auto-prune when exceeded
+    chunk_count: int = 0
 
     def __post_init__(self) -> None:
-        """Validate document fields after initialisation."""
+        if not self.id and "source_url" in self.metadata:
+            raw = f"{self.metadata['source_url']}:{self.updated_at}"
+            self.id = hashlib.sha256(raw.encode()).hexdigest()[:16]
         if not self.id:
-            self.id = str(uuid.uuid4())
-        if self.version < 1:
-            raise ValueError("Version must be >= 1")
-        if not isinstance(self.tags, list):
-            raise TypeError("tags must be a list")
-        if not isinstance(self.metadata, dict):
-            raise TypeError("metadata must be a dict")
+            self.id = hashlib.sha256(
+                f"{datetime.now(timezone.utc).isoformat()}:{id(self)}".encode()
+            ).hexdigest()[:16]
 
-    def update(
-        self,
-        content: Optional[str] = None,
-        tags: Optional[list[str]] = None,
-        metadata: Optional[dict] = None,
-        increment_version: bool = True,
-    ) -> "Document":
-        """Create a new version of this document.
+    @property
+    def source_url(self) -> str:
+        return self.metadata.get("source_url", "")
 
-        Saves the current state into previous_versions before applying changes.
-
-        Args:
-            content: New content (or None to keep current).
-            tags: New tags (or None to keep current).
-            metadata: New metadata (or None to keep current).
-            increment_version: Whether to bump version number.
-
-        Returns:
-            Self for chaining.
-        """
-        snapshot = {
-            "version": self.version,
-            "content": self.content,
-            "tags": list(self.tags),
-            "metadata": dict(self.metadata),
-            "updated_at": self.updated_at,
-        }
-        self.previous_versions.append(snapshot)
-        # Auto-prune: keep only most recent max_versions
-        if len(self.previous_versions) > self.max_versions:
-            excess = len(self.previous_versions) - self.max_versions
-            self.previous_versions = self.previous_versions[excess:]
-
-        if content is not None:
-            self.content = content
-        if tags is not None:
-            self.tags = list(tags)
-        if metadata is not None:
-            self.metadata = dict(metadata)
-
-        if increment_version:
-            self.version += 1
-
-        self.updated_at = datetime.now(timezone.utc).isoformat()
-        return self
+    @property
+    def source_type(self) -> str:
+        return self.metadata.get("source_type", "unknown")
 
     def to_dict(self) -> dict:
-        """Convert document to a JSON-serialisable dictionary."""
         return {
             "id": self.id,
-            "version": self.version,
+            "summary": self.summary,
             "tags": list(self.tags),
             "metadata": dict(self.metadata),
-            "content": self.content,
             "collection": self.collection,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
-            "previous_versions": list(self.previous_versions),
+            "chunk_count": self.chunk_count,
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "Document":
-        """Create a Document from a dictionary.
-
-        Handles both full and partial data gracefully.
-        """
+    def from_dict(cls, data: dict) -> "IndexedDocument":
         safe = {
-            "id": data.get("id", str(uuid.uuid4())),
-            "version": data.get("version", 1),
+            "id": data.get("id", ""),
+            "summary": data.get("summary", ""),
             "tags": data.get("tags", []),
             "metadata": data.get("metadata", {}),
-            "content": data.get("content", ""),
-            "collection": data.get("collection", "default"),
-            "created_at": data.get(
-                "created_at", datetime.now(timezone.utc).isoformat()
-            ),
-            "updated_at": data.get(
-                "updated_at", datetime.now(timezone.utc).isoformat()
-            ),
-            "previous_versions": data.get("previous_versions", []),
+            "collection": data.get("collection", "unclassified"),
+            "created_at": data.get("created_at", datetime.now(timezone.utc).isoformat()),
+            "updated_at": data.get("updated_at", datetime.now(timezone.utc).isoformat()),
+            "chunk_count": data.get("chunk_count", 0),
         }
         return cls(**safe)
 
-    @property
-    def summary(self) -> str:
-        """Short summary string for display."""
-        preview = self.content[:80].replace("\n", " ").strip()
-        if len(self.content) > 80:
-            preview += "…"
-        return f"[v{self.version}] {preview}"
-
     def __repr__(self) -> str:
-        return (
-            f"Document(id={self.id!r}, version={self.version}, "
-            f"collection={self.collection!r}, tags={self.tags})"
-        )
+        return f"IndexedDocument(id={self.id!r}, collection={self.collection!r}, tags={self.tags})"
