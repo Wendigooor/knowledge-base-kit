@@ -13,7 +13,8 @@ from typing import Optional
 
 import chromadb
 from chromadb.config import Settings as ChromaSettings
-from chromadb.api.types import WhereFilter
+# WhereFilter type — use dict for newer ChromaDB versions
+WhereFilter = dict
 
 from kbk.config import KBKConfig
 from kbk.document import Document
@@ -67,6 +68,10 @@ class KnowledgeStore:
                     f"Failed to get/create collection '{name}': {exc}"
                 ) from exc
         return self._collections[name]
+
+    def _init_client(self) -> None:
+        """Initialize the ChromaDB client (lazy)."""
+        _ = self.client
 
     @staticmethod
     def _doc_to_chroma_data(doc: Document) -> tuple[str, str, dict]:
@@ -207,25 +212,56 @@ class KnowledgeStore:
         except Exception:
             return False
 
+    def export_to_json(self, path: str) -> int:
+        """Export all documents from all collections to a JSON file.
+
+        Args:
+            path: Output JSON file path.
+
+        Returns:
+            Number of documents exported.
+        """
+        collections = self.list_collections()
+        export_data = {
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "collections": {},
+        }
+        total = 0
+        for col_name in collections:
+            docs = self.list_documents(collection=col_name, limit=999999)
+            export_data["collections"][col_name] = [
+                doc.to_dict() for doc in docs
+            ]
+            total += len(docs)
+
+        path_obj = Path(path)
+        path_obj.parent.mkdir(parents=True, exist_ok=True)
+        path_obj.write_text(
+            json.dumps(export_data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return total
+
     def search(
         self,
         query: str,
-        collection: str = "default",
-        top_k: Optional[int] = None,
+        n_results: Optional[int] = None,
+        collection_filter: Optional[str] = None,
         filters: Optional[dict] = None,
-    ) -> list[tuple[Document, float]]:
+    ) -> list[Document]:
         """Semantic search over documents.
 
         Args:
             query: Natural language query string.
-            collection: Collection to search in.
-            top_k: Number of results (default from config).
-            filters: Optional metadata filters (e.g. {"tags": "[\"python\"]"}).
+            n_results: Number of results (default from config).
+            collection_filter: Collection name to search in (default from config).
+            filters: Optional metadata filters.
 
         Returns:
-            List of (Document, similarity_score) tuples, sorted by relevance.
+            List of Document instances sorted by relevance.
         """
-        top_k = top_k or self.config.top_k
+        n_results = n_results or self.config.top_k
+        collection = collection_filter or self.config.default_collection
         col = self._get_collection(collection)
 
         where_filter: Optional[WhereFilter] = None
@@ -240,7 +276,7 @@ class KnowledgeStore:
         try:
             results = col.query(
                 query_texts=[query],
-                n_results=top_k,
+                n_results=n_results,
                 where=where_filter,
             )
         except Exception as exc:
@@ -256,10 +292,7 @@ class KnowledgeStore:
                 content=results["documents"][0][i] if results.get("documents") else "",
                 metadata=results["metadatas"][0][i] if results.get("metadatas") else {},
             )
-            distance = results["distances"][0][i] if results.get("distances") else 0.0
-            # Convert distance to similarity (1 / (1 + distance))
-            similarity = 1.0 / (1.0 + distance)
-            documents.append((doc, similarity))
+            documents.append(doc)
 
         return documents
 

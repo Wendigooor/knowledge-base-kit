@@ -29,7 +29,7 @@ def cli(ctx: click.Context, config: str | None, path: str | None):
         cfg.export_path = os.path.join(path, "exports")
     ctx.obj["config"] = cfg
     ctx.obj["store"] = KnowledgeStore(cfg)
-    ctx.obj["versioning"] = VersionManager(cfg)
+    ctx.obj["versioning"] = VersionManager(config=cfg)
     ctx.obj["sync"] = SyncManager(cfg)
 
 
@@ -39,9 +39,11 @@ def init(ctx: click.Context):
     """Initialize a new knowledge base."""
     cfg: KBKConfig = ctx.obj["config"]
     store: KnowledgeStore = ctx.obj["store"]
+    sync_mgr: SyncManager = ctx.obj["sync"]
     os.makedirs(cfg.db_path, exist_ok=True)
     os.makedirs(cfg.export_path, exist_ok=True)
     store._init_client()
+    sync_mgr._get_or_init_repo()
     click.echo(f"✅ Knowledge base initialized at {cfg.db_path}")
 
 
@@ -90,10 +92,10 @@ def search(ctx: click.Context, query: str, collection: str | None, limit: int):
     if not results:
         click.echo("No results found.")
         return
-    for r in results:
-        tags = f" [{', '.join(r.tags)}]" if r.tags else ""
-        click.echo(f"  [{r.collection}] {r.id} v{r.version}{tags}")
-        click.echo(f"    {r.content[:150]}..." if len(r.content) > 150 else f"    {r.content}")
+    for doc in results:
+        tags = f" [{', '.join(doc.tags)}]" if doc.tags else ""
+        click.echo(f"  [{doc.collection}] {doc.id} v{doc.version}{tags}")
+        click.echo(f"    {doc.content[:150]}..." if len(doc.content) > 150 else f"    {doc.content}")
         click.echo()
 
 
@@ -103,10 +105,14 @@ def sync(ctx: click.Context):
     """Synchronize with remote git repository."""
     sync_mgr: SyncManager = ctx.obj["sync"]
     store: KnowledgeStore = ctx.obj["store"]
+    cfg: KBKConfig = ctx.obj["config"]
 
-    # Push local changes
-    store.export_to_json(os.path.join(ctx.obj["config"].export_path, "chromadb-export.json"))
-    push_result = sync_mgr.push_to_git()
+    # Export all documents to JSON
+    all_docs = []
+    for col in store.list_collections():
+        all_docs.extend(store.list_documents(collection=col, limit=999999))
+    store.export_to_json(os.path.join(cfg.export_path, "chromadb-export.json"))
+    push_result = sync_mgr.push_to_git(all_docs)
     
     # Pull remote changes
     pulled = sync_mgr.pull_from_git()
@@ -135,16 +141,19 @@ def sync(ctx: click.Context):
 def history(ctx: click.Context, collection: str | None, doc_id: str | None):
     """Show version history for documents."""
     versioning: VersionManager = ctx.obj["versioning"]
-    if doc_id and collection:
-        history = versioning.get_history(doc_id, collection)
-        if not history:
-            click.echo("No history found.")
-            return
-        click.echo(f"History for {collection}/{doc_id}:")
-        for h in history:
-            click.echo(f"  v{h['version']} — {h.get('updated_at', h.get('created_at', '?'))}")
+    if doc_id:
+        try:
+            history = versioning.get_history(doc_id)
+            if not history:
+                click.echo("No history found.")
+                return
+            click.echo(f"History for {doc_id}:")
+            for h in history:
+                click.echo(f"  v{h['version']} — {h.get('updated_at', h.get('created_at', '?'))}")
+        except Exception as e:
+            click.echo(f"❌ {e}")
     else:
-        click.echo("Use: kbk history --collection <name> --id <doc-id>")
+        click.echo("Use: kbk history --id <doc-id>")
 
 
 @cli.command()
@@ -156,8 +165,13 @@ def rollback(ctx: click.Context, collection: str, doc_id: str, version: int):
     """Rollback a document to a previous version."""
     store: KnowledgeStore = ctx.obj["store"]
     versioning: VersionManager = ctx.obj["versioning"]
-    
-    restored = versioning.rollback(doc_id, collection, version)
+
+    doc = store.get(doc_id, collection)
+    if doc is None:
+        click.echo(f"❌ Document {collection}/{doc_id} not found")
+        return
+
+    restored = versioning.rollback(doc, version)
     if restored:
         store.update(restored)
         click.echo(f"✅ Rolled back {collection}/{doc_id} to v{version}")
