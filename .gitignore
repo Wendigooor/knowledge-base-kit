@@ -1,13 +1,27 @@
+# Python
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
-.env
-.venv/
-venv/
+*.pyc
+*.pyo
 *.egg-info/
 dist/
 build/
+*.egg
+
+# Environment
+.env
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
 .DS_Store
-.kbk/
-chromadb/
+Thumbs.db
+
+# KBK runtime
+~/.kbk/
+chromadb-knowledge-dump.json
