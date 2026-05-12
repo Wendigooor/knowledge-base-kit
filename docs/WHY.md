@@ -1,69 +1,52 @@
-# Why Knowledge Base Kit?
+# Why KBK (Knowledge Base Kit)?
 
-## Проблема
+## The Problem
 
-Мы — enterprise. SoftSwiss. 50+ микросервисов, 100+ разработчиков, легаси 10+ лет.
+Enterprise teams generate massive amounts of knowledge every day:
+- **Architecture Decision Records (ADRs)** in Confluence
+- **Runbooks and deployments** in Confluence
+- **Code and technical documentation** in GitLab/GitHub
+- **Tickets and decisions** in Jira
 
-Контекст живёт:
-- В Confluence — никто не обновляет, страницы мертвы через месяц
-- В Jira — размазан по сотням тикетов
-- В Git — читай 50k строк чтобы понять один эндпоинт
-- В головах у людей — уходит когда человек уходит
-- В Slack — потерян навсегда
+This knowledge is scattered, unstructured, and buried in HTML garbage.
+Nobody can find anything. LLM agents hallucinate because they lack enterprise context.
+New team members spend months ramping up.
 
-LLM не могут работать с этим контекстом. Люди тратят недели на погружение.
+## The False Start (v1 — Deprecated)
 
-## Решение, которое НЕ работает
+v1 tried to build a document store in ChromaDB + Git.
+Users had to write documentation INTO KBK.
+This failed because:
+- Nobody wants to write documentation in yet another tool
+- Maintaining sync between Git and ChromaDB was complex
+- Versioning duplicated what already exists in git/Confluence history
+- The "write to us" model is doomed in enterprise
 
-Заставить всю компанию писать документацию в новый инструмент — **обречено**.
+## The Right Approach (v2)
 
-Confluence мёртв не потому что плохой инструмент. Confluence мёртв потому что documentation is a tax, not a feature. Люди пишут код, а не документацию.
+KBK v2 takes a completely different approach:
 
-## Решение, которое работает
+**KBK is an index, not a store.**
 
-KBK — это **не хранилище документов**. KBK — это **семантический индекс** над существующими источниками.
+The source of truth stays where it was born:
+- Confluence (documentation, ADRs)
+- Jira (tickets, tasks)
+- Git (code, MR comments)
 
-**Source of truth остаётся там, где родился:**
-- Confluence страница → KBK индексирует её содержимое
-- Jira тикет → KBK создаёт семантическую ссылку
-- Git MR → KBK анализирует и классифицирует
+KBK walks a **whitelist** (Allowlist), fetches only what's approved,
+cleans the HTML garbage, distills meaning through an LLM,
+and provides **two outputs**:
 
-**Zero friction для команды.** Никто не меняет привычки. Всё работает как работало. KBK просто слушает и индексирует.
+1. **MCP Server (for machines)** — Cursor, Claude Desktop, and custom agents
+   can query the index semantically and get clean, relevant context in milliseconds.
+2. **Confluence Showcase (for humans)** — an auto-generated Read-Only page
+   that proves the system works and gives managers visibility.
 
-## Как это работает
+## Core Principles
 
-```
-[Confluence] ──вебхук──┐
-[Jira] ───────вебхук───┤──→ [KBK Indexer] ──→ [ChromaDB] ──→ [Read-Only Space]
-[GitLab] ─────вебхук───┘                              │
-                                                      ▼
-                                              [Семантический поиск]
-                                              [AI-ассистент в Slack]
-                                              [Авто-сгенерированная витрина]
-```
-
-1. **Connectors** слушают изменения в источниках (вебхуки + cron)
-2. **Indexer** чистит, суммаризирует (LLM), классифицирует, чанкует, эмбеддит
-3. **ChromaDB** хранит векторы + метаданные + ссылки на оригиналы
-4. **Read-Only Space** — авто-генерируемая витрина в Confluence/Backstage
-
-## Аудитория
-
-| Кто | Как использует KBK |
-|-----|-------------------|
-| System Analyst | Ищет "rate limiting architecture" → видит ADR из Confluence |
-| Developer | Спрашивает Slack-бота "как деплоить payment-service" → получает runbook |
-| Architect | "Покажи все решения по Kafka" → хронология ADR |
-| QA | "Какие acceptance criteria для бонусов?" → ссылка на Jira |
-| New hire | Onboarding за 2 дня вместо месяца через витрину |
-
-## Чем это отличается
-
-| Аспект | Традиционный подход (Confluence/Notion) | KBK v2 |
-|--------|----------------------------------------|--------|
-| Кто пишет | Люди (никто не пишет) | LLM + люди (люди пишут код, LLM индексирует) |
-| Где живёт | В одном инструменте | Распределённо, ссылки на оригиналы |
-| Актуальность | Мертва через месяц | Живёт пока жив оригинал |
-| Версионирование | Нет | В оригинале (git / Confluence history) |
-| Поиск | Full-text | Семантический + LLM |
-| Внедрение | "Начните писать сюда" | Zero friction — ничего не меняется |
+1. **Zero Friction** — nobody changes their workflow. Work in Confluence as always.
+2. **Pull, not Push** — no webhooks, no queues, no dead letters. Just `kbk sync`.
+3. **Allowlist, not Firehose** — only whitelisted sources. No trash from random pages.
+4. **Dedup by default** — SHA-256 hashing ensures unchanged docs are skipped.
+5. **One LLM call per doc** — structured JSON output for both summary and tags.
+6. **Source URL in every chunk** — every search result links back to the original.

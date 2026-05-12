@@ -1,144 +1,184 @@
 # Knowledge Base Kit (KBK) — Architecture v2
 
-## Концепция: Умный Индекс (Aggregator), не хранилище
+> Enterprise Semantic Index. Pull + Allowlist. No webhooks.
+> Two outputs: MCP Server (for LLMs) + Confluence Showcase (for humans).
 
-**KBK — это не Source of Truth.** Source of Truth остаётся там, где родился:
-- Confluence (документация, ADR)
-- Jira (тикеты, задачи)
-- Git (код, комментарии к MR)
-- Slack (обсуждения, решения)
+---
 
-KBK — это **семантический индекс** над всеми этими источниками. Он ходит по белому списку (Allowlist), забирает только нужное, индексирует, классифицирует и предоставляет единую точку поиска. Без вебхуков — только Pull по команде `kbk sync`.
+## Concept: Smart Index (Aggregator), Not a Store
+
+**KBK is NOT a source of truth.** The source of truth stays where it was born:
+- **Confluence** — documentation, ADRs
+- **Jira** — tickets, tasks
+- **Git** — code, merge request comments
+- **Slack** — discussions, decisions
+
+KBK is a **semantic index** over all these sources. It walks a whitelist (Allowlist), fetches only what's needed, indexes, classifies, and provides a unified search point. No webhooks — only Pull via `kbk sync`.
 
 ```
-[Confluence] ──────┐
-[Jira] ────────────┤─── kbk sync ──── [StateTracker] ─── [Indexer] ──→ [ChromaDB]
-[Git] ─────────────┤       │                                  │
-[Slack] ───────────┘       ├─ SHA-256 diff (skip unchanged)    ├─ clean HTML
-                            └─ delete orphans                  ├─ LLM summarize + classify
-                                                               ├─ chunk (1k tokens)
-                                                               └─ embed
-                                                                      │
+[Confluence] --------+
+[Jira] --------------+--- kbk sync --- [StateTracker] --- [Indexer] ----→ [ChromaDB]
+[Git] ---------------+       |                                |
+[Slack] -------------+       |-- SHA-256 diff (skip unchanged) |-- clean HTML
+                             +-- delete orphans                 |-- LLM summarize + classify
+                                                               |-- chunk (1k tokens)
+                                                               +-- embed
+                                                                      |
                                                                       ▼
                                                       [Read-Only Confluence Space]
-                                                      (авто-генерируемая витрина)
+                                                      (auto-generated showcase)
 ```
 
-## Ключевые отличия от v1
+---
 
-| Аспект | v1 (отменено) | v2 (новая) |
-|--------|---------------|------------|
-| Хранилище | ChromaDB + Git (JSON) | ChromaDB + connectors |
-| Source of Truth | KBK сам | Confluence/Jira/Git — оригиналы |
-| Версионирование | snapshot-based | В оригиналах (git history, Confluence history) |
-| Sync | git push/pull | Pull по белым спискам (allowlist + kbk sync) |
-| Документ | Полный content + версии | Summary (LLM) + source_url + tags |
-| CLI | 9 команд (sync, history, rollback) | 5 команд (index, search, status, connectors, explore) |
-| Генерация документации | Нет | Read-Only Confluence space |
+## Key Differences from v1
 
-## Архитектура
+| Aspect | v1 (deprecated) | v2 (current) |
+|--------|-----------------|--------------|
+| Storage | ChromaDB + Git (JSON) | ChromaDB + connectors |
+| Source of Truth | KBK itself | Confluence/Jira/Git — originals |
+| Versioning | snapshot-based | In originals (git history, Confluence history) |
+| Sync | git push/pull | Pull from whitelist (allowlist + kbk sync) |
+| Document | Full content + versions | Summary (LLM) + source_url + tags |
+| CLI | 9 commands (sync, history, rollback) | 6 commands (init, sync, serve, build-showcase, search, status) |
+| Documentation Generation | None | Read-Only Confluence space |
+| Infrastructure | Webhooks, queues, dead letters | None — just CLI |
 
-### Слой Ingestion (connectors/)
+---
+
+## Architecture
+
+### Ingestion Layer (connectors/)
 
 ```
 connectors/
 ├── __init__.py
-├── base.py           # AbstractConnector
-├── confluence.py     # Confluence REST API → Pull по allowlist
-├── jira.py           # Jira REST API → Pull по allowlist
-├── gitlab.py         # GitLab API → Pull по allowlist
-└── slack.py          # Slack API → Pull по allowlist
+├── confluence.py     # Confluence REST API → Pull via allowlist
+├── jira.py           # Jira REST API → Pull via allowlist (coming in v0.3)
+├── gitlab.py         # GitLab API → Pull via allowlist (coming in v0.3)
+└── slack.py          # Slack API → Pull via allowlist (coming in v0.3)
 ```
 
-Каждый коннектор выполняет Pull по белому списку (Allowlist) из `targets.yaml`.
-При изменении документа:
-1. Получает сырой контент
-2. Отдаёт в `indexer.py` для обработки
+Each connector performs a Pull from the whitelist defined in `targets.yaml`.
+When a document is found:
+1. Fetches raw content
+2. Passes to `indexer.py` for processing
+3. Hashes content with SHA-256, compares with StateTracker
+4. Only unchanged documents are skipped
 
-### Слой Processing (indexer.py)
+### Processing Layer (indexer.py)
 
-```python
-class Indexer:
-    def process(self, raw_text: str, source: str, metadata: dict) -> IndexedDocument:
-        # 1. Очистка — убрать HTML, макросы, мусор
-        cleaned = self.clean(raw_text)
-        
-        # 2. LLM суммаризация — выделить суть (100-200 токенов)
-        summary = self.llm_summarize(cleaned)
-        
-        # 3. Классификация — теги, категория
-        tags = self.llm_classify(cleaned)
-        
-        # 4. Чанкинг — разбить на куски (512-1024 токенов)
-        chunks = self.chunk(summary, cleaned)
-        
-        # 5. Эмбеддинги — векторизовать каждый chunk
-        embeddings = self.embed(chunks)
-        
-        # 6. Сохранить в ChromaDB
-        self.store.upsert(doc_id, chunks, embeddings, {
-            "source_url": metadata["url"],
-            "source_type": metadata["type"],  # confluence | jira | git | slack
-            "tags": tags,
-            "summary": summary,
-            "updated_at": metadata["updated_at"],
-            "access_group": metadata.get("access_group", "public"),
-        })
+The AI pipeline processes each document through these stages:
+
+1. **Clean** — strip HTML, Confluence macros, ac: tags. Preserve angle brackets in code/pre/tt blocks.
+2. **LLM Summarize + Classify** — single API call returns structured JSON: `{"summary": "...", "tags": [...]}`. Falls back to truncation if LLM unavailable.
+3. **Chunk** — split into segments of ~1000 chars at sentence boundaries with word-aware overlap.
+4. **Embed** — store vectors in ChromaDB with full metadata.
+
+### Presentation Layer (Showcase)
+
+Generator that creates a Read-Only Confluence space (or Markdown file):
+
+1. Stable page skeleton with expand/collapse sections per collection
+2. Each document shown as: LLM summary + tags + link to original
+3. Banner: "🤖 Auto-generated by KBK. Last updated: [date]"
+
+### MCP Server (Machine Interface)
+
+Model Context Protocol server over stdio. Three tools:
+
+- `search_knowledge(query, collection, limit, access_group)` — semantic search
+- `get_document_summary(collection, limit)` — list all documents in a collection
+- `list_collections()` — list all collections
+
+Designed for Cursor, Claude Desktop, and custom agents.
+
+---
+
+## State Management
+
+### State Tracker
+
+SHA-256 hash-based dedup stored as JSON. Each source URL maps to `{"hash": "...", "chunk_ids": [...]}`.
+
+- **Atomic writes:** write to `.tmp` file, then `replace()` — no partial writes
+- **Corruption recovery:** backup to `.corrupt.bak` before resetting
+- **Concurrency safety:** POSIX `fcntl.flock` — second process gets "another sync running"
+- **Dedup:** `mark_indexed()` before new content, `has_changed()` checks hash
+
+### ChromaDB
+
+Persistent ChromaDB instance at `~/.kbk/chromadb/`. Each collection maps to a Confluence space or GitLab repo. Metadata includes source_url, summary, tags, access_group, content_hash.
+
+---
+
+## Data Flow (kbk sync)
+
+```
+1. Load targets.yaml          → whitelisted sources
+2. For each target:
+   a. Acquire state lock      → fcntl.flock
+   b. Fetch URLs from source  → list_known_urls()
+   c. Reconcile orphans       → diff tracked vs known → delete_chunks
+   d. Diff new/changed pages  → process_target() → has_changed
+   e. For each new page:
+      - Clean HTML
+      - LLM summarize + classify (single call)
+      - Chunk (sentence-boundary, word overlap)
+      - Upsert to ChromaDB
+      - mark_indexed()
+   f. Release state lock
+3. Print summary              → cost, chunks, orphans
 ```
 
-### Слой Presentation (Read-Only Space)
+---
 
-Генератор Confluence space (или Backstage dashboard), который:
+## Error Handling
 
-1. **Жёсткий скелет** (не меняется):
+| Scenario | Behavior |
+|----------|----------|
+| Confluence API 429 | Exponential backoff (2^attempt), max 3 retries |
+| Confluence API 401/403 | Returns None, logged |
+| LLM API timeout | 3 retries with 2^attempt backoff |
+| LLM auth failure (401) | Immediate `LLMError`, no retry |
+| LLM JSON parse failure | Logged, fallback to truncation + heuristic tags |
+| ChromaDB delete failure | Logged (not silent pass anymore) |
+| Corrupt state.json | Backed up, reset to empty, logged |
+| Concurrent sync | Lock busy → "Another sync running" message |
+
+---
+
+## Security
+
+- **ACL:** `access_group` field enforced in `store.search()` and MCP server
+- **API keys:** stored in config file (env-var-only mode planned)
+- **XSS prevention:** `html.escape()` on all user data in Showcase
+- **Confluence auth:** Basic Auth with base64-encoded token
+- **No HTTPS enforcement:** URL validation planned
+
+---
+
+## CLI Reference
+
 ```
-📁 Architecture      → ADR, service contracts, diagrams
-📁 Infrastructure    → K8s, databases, CI/CD
-📁 Business Logic    → domain models, workflows
-📁 Runbooks          → on-call, incident responses
-📁 Decisions Log     → chronological ADR
-📁 Team & Ownership  → who owns what
+Usage: kbk [OPTIONS] COMMAND [ARGS]...
+
+Commands:
+  init              Initialize KBK: dirs, ChromaDB, StateTracker, sample config
+  sync              Pull + Diff + ETL + Embed (--dry-run for cost preview)
+  serve             Start MCP server (stdio)
+  build-showcase    Generate Read-Only showcase (--output markdown|confluence)
+  search <query>    Semantic search (--collection, --limit)
+  status            Index statistics
 ```
 
-2. **LLM наполнение** для каждого документа:
-   - Определяет категорию по тегам/семантике
-   - Если не уверен — помечает `Unclassified`
+---
 
-3. **Ссылки на оригиналы** — каждая карточка ведёт в Confluence/Jira/Git
+## Why This Is Better Than v1
 
-### Модель данных
-
-```python
-@dataclass
-class IndexedDocument:
-    id: str                          # hash(source_url + version)
-    summary: str                     # LLM-generated (100-200 токенов)
-    tags: list[str]                  # LLM-classified
-    metadata: dict                   # source_url, source_type, access_group
-    collection: str                  # architecture | infrastructure | business | runbooks
-    created_at: str                  # когда впервые проиндексирован
-    updated_at: str                  # когда последний раз обновлён в источнике
-    chunk_count: int                 # сколько чанков в ChromaDB
-```
-
-**Нет previous_versions.** Нет content (только summary). Версионирование живёт в источниках.
-
-### CLI
-
-| Команда | Назначение |
-|---------|-----------|
-| `kbk init` | Инициализировать ChromaDB |
-| `kbk index` | Запустить индексацию (все connectors) |
-| `kbk search` | Семантический поиск |
-| `kbk status` | Статус индекса (сколько документов, по источникам) |
-| `kbk connectors` | Список/статус коннекторов |
-| `kbk explore` | Открыть Read-Only space в браузере |
-
-### Чем это лучше v1
-
-1. **Zero friction** — никто не меняет привычки. Работают в Confluence/Jira/Git как обычно
-2. **Нет дублирования** — документ существует в одном месте
-3. **Не надо версионировать** — история в оригинале (git log, Confluence history)
-4. **Масштабируется** — Webhooks вместо полной синхронизации
-5. **Enterprise-ready** — ACL из оригиналов, audit trail, знакомая экосистема
-6. **Проверяемо** — QA идёт по ссылке из витрины и видит актуальный документ в оригинале
+1. **Zero friction** — nobody changes their workflow. Work in Confluence/Jira/Git as usual.
+2. **No duplication** — every document exists in one place.
+3. **No versioning needed** — history lives in the originals (git log, Confluence history).
+4. **Scales** — Pull model avoids webhook infrastructure complexity.
+5. **Enterprise-ready** — ACL from originals via access_group, audit trail via source URLs.
+6. **Verifiable** — QA follows the link from the showcase and sees the actual document.

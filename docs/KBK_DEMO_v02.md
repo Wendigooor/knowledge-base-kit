@@ -1,14 +1,14 @@
 # KBK v0.2 — Live Demo Walkthrough
 
-> Что: Enterprise Semantic Index. Pull + Allowlist.
-> Как: Confluence ADR + GitLab README → clean → LLM summarize → chunk → ChromaDB → MCP + Showcase
-> Дата: 2026-05-12
+> What: Enterprise Semantic Index. Pull + Allowlist.
+> Flow: Confluence ADR + GitLab README → clean → LLM summarize → chunk → ChromaDB → MCP + Showcase
+> Date: 2026-05-12
 
 ---
 
-## 1. Исходные данные (Input)
+## 1. Input Data
 
-Три источника из разных систем, разный формат, разный язык.
+Three sources from different systems, different formats, different languages.
 
 ### 🏛️ Confluence (ARCH) — ADR-007
 
@@ -46,36 +46,36 @@ Endpoints:
   POST /api/v1/refunds    - Process refund
 ```
 
-**Проблема:** Все три — это raw HTML с Confluence макросами (`<ac:...>`, `<code>`, `<pre>`). Если скормить это LLM напрямую — 40% токенов уйдет на HTML-мусор.
+**The Problem:** All three are raw HTML with Confluence macros (`<ac:...>`, `<code>`, `<pre>`). Feeding this directly to an LLM wastes 40% of tokens on HTML garbage.
 
 ---
 
-## 2. Индексация (ETL Pipeline)
+## 2. Indexing (ETL Pipeline)
 
-### Clean: HTML → чистый текст
+### Clean: HTML → plain text
 
 ```
-Input:  579 chars (с <ac:macro>, <code>List<String></code>)
+Input:  579 chars (with <ac:macro>, <code>List<String></code>)
 Output: 330 chars (
-→ HTML макросы удалены
-→ <code>List<String></code> → List<String> (angle brackets сохранены!)
-→ ac:link, ri:user удалены
-→ Только смысл
+→ HTML macros removed
+→ <code>List<String></code> → List<String> (angle brackets preserved!)
+→ ac:link, ri:user tags stripped
+→ Only meaningful content remains
 ```
 
-### Chunk: нарезка по предложениям
+### Chunk: Sentence-boundary split
 
 ```
 Input:  330 chars
-Chunk:  2 chunks (chunk_size=300, overlap=100 символов)
+Chunks: 2 (chunk_size=300, overlap=100 chars)
 
 Chunk 1: "Status: APPROVED. ADR-007: API Gateway Migration..."
 Chunk 2: "...Horizontal scaling via HPA. Canary deployments..."
-         ^ overlap (содержит последние ~100 символов
-           первого чанка, сдвинутые до word boundary)
+         ^ overlap (last ~100 chars from chunk 1,
+           extended to the next word boundary)
 ```
 
-### LLM (если ключ есть) — один вызов на документ
+### LLM (if API key configured) — one call per document
 
 ```json
 {
@@ -84,35 +84,35 @@ Chunk 2: "...Horizontal scaling via HPA. Canary deployments..."
 }
 ```
 
-### Embed: векторы в ChromaDB
+### Embed: Vectors into ChromaDB
 
 ```
-3 документов → 5 чанков → 5 векторов (384d all-MiniLM-L6-v2)
-           → source_url привязан к каждому чанку
-           → summary в каждом чанке (не теряется контекст)
+3 documents → 5 chunks → 5 vectors (384d all-MiniLM-L6-v2)
+           → source_url attached to every chunk
+           → summary attached to every chunk (context preserved)
 ```
 
 ---
 
-## 3. Поиск (semantic search)
+## 3. Semantic Search
 
 ### Query: "API Gateway migration Kubernetes"
 
 ```
 🏆 [arch] ADR-007: API Gateway Migration to Kubernetes
-   Источник: https://confluence.softswiss.com/spaces/ARCH/pages/ADR-007
+   Source: https://confluence.softswiss.com/spaces/ARCH/pages/ADR-007
    Summary: API Gateway migrates from NGINX to Kong on K8s...
    Tags: #gateway #kubernetes #istio
 
-   [platform] payment-service README (ссылается на ADR-007)
+   [platform] payment-service README (cross-references ADR-007)
 ```
 
-### Query: "как задеплоить payment service" (русский!)
+### Query: "how to deploy payment service" (semantic, not keyword!)
 
 ```
 🏆 [runbooks] Runbook: Payment Service Deployment
-   Источник: https://confluence.softswiss.com/spaces/ENG/pages/RUNBOOK-PAYMENT
-   Команды: git pull, docker build, kubectl apply
+   Source: https://confluence.softswiss.com/spaces/ENG/pages/RUNBOOK-PAYMENT
+   Commands: git pull, docker build, kubectl apply
    Rollback: kubectl rollout undo
 ```
 
@@ -120,17 +120,17 @@ Chunk 2: "...Horizontal scaling via HPA. Canary deployments..."
 
 ```
 🏆 [platform] payment-service: Go microservice
-   Источник: https://gitlab.softswiss.com/core/payment-service
-   Стек: Go 1.22, PostgreSQL 15, Redis 7
+   Source: https://gitlab.softswiss.com/core/payment-service
+   Stack: Go 1.22, PostgreSQL 15, Redis 7
    Endpoints: payments, refunds
 ```
 
 ---
 
-## 4. MCP Server — как LLM получает знания
+## 4. MCP Server — How LLMs Consume KBK
 
 ```python
-# Cursor plugin делает MCP call:
+# Cursor plugin makes an MCP call:
 result = mcp_call("search_knowledge", {
     "query": "payment service architecture",
     "limit": 3
@@ -157,19 +157,19 @@ result = mcp_call("search_knowledge", {
 }
 ```
 
-**Что получает LLM:**
-- ✅ **Чистый текст** — без HTML, без Confluence макросов
-- ✅ **Source URL** — может дать ссылку разработчику
-- ✅ **Summary** — контекст за 2-3 предложения
-- ✅ **Tags** — для классификации
-- ❌ **Не получает** — HTML мусор, права доступа других документов
+**What the LLM gets:**
+- ✅ **Clean text** — no HTML, no Confluence macros
+- ✅ **Source URL** — can provide a link back to the developer
+- ✅ **Summary** — context in 2-3 sentences
+- ✅ **Tags** — for classification
+- ❌ **Not exposed** — HTML garbage, other documents' access groups
 
 ---
 
-## 5. Confluence Showcase — что видит человек
+## 5. Confluence Showcase — What Humans See
 
 ```
-=======================  КОЛЛЕКЦИИ  =======================
+=======================  COLLECTIONS  =======================
 
 📁 Arch (1 chunks)
   ADR-007: API Gateway Migration to Kubernetes
@@ -189,13 +189,13 @@ result = mcp_call("search_knowledge", {
 
 ---
 
-## 6. Zero Friction: второй sync
+## 6. Zero Friction: Second Sync
 
 ```bash
 $ kbk sync
 
 ── CONFLUENCE: ARCH
-  No new/changed documents  ← StateTracker: hash совпадает, skip
+  No new/changed documents  ← StateTracker: hash matches, skip
 
 ── CONFLUENCE: ENG
   No new/changed documents
@@ -206,33 +206,33 @@ $ kbk sync
 📊 Summary: 0 new, 0 chunks, $0.0000 LLM cost
 ```
 
-**Что сэкономили:**
-- 3 LLM вызова (= ~$0.006)
-- 3 Confluence API запроса
-- 3 ChromaDB upsert'а
-- Время: ~0.5 сек вместо ~10 сек
+**What we saved:**
+- 3 LLM calls (= ~$0.006)
+- 3 Confluence API requests
+- 3 ChromaDB upserts
+- Time: ~0.5s instead of ~10s
 
 ---
 
-## 7. Архитектурные решения (почему это работает)
+## 7. Architecture Decisions (Why It Works)
 
-| Решение | Проблема | Как решили |
-|---------|----------|------------|
-| **Pull + Allowlist** | Webhooks ломаются, мусор отовсюду | Только whitelisted targets, только по команде |
-| **SHA-256 dedup** | LLM жрет деньги на тех же данных | skip unchanged, 0 cost |
-| **Один LLM call** | Два вызова = 2x cost и latency | Structured JSON: summary + tags |
-| **Source URL в каждом чанке** | "Откуда это?" | Каждый чанк знает оригинал |
-| **Word-boundary overlap** | Слова разрезаны между чанками | find(' ', overlap_start) |
-| **fcntl flock** | Два sync параллельно ломают state | POSIX file lock |
-| **Angle bracket protection** | List\<String\> убит HTML cleaner | code/pre/tt protection phase |
+| Decision | Problem | How We Solved It |
+|----------|---------|------------------|
+| **Pull + Allowlist** | Webhooks break, trash everywhere | Only whitelisted targets, only on demand |
+| **SHA-256 dedup** | LLM burns money on same data | skip unchanged, 0 cost on re-run |
+| **Single LLM call** | Two calls = 2x cost + latency | Structured JSON output: summary + tags |
+| **Source URL per chunk** | "Where does this come from?" | Every chunk knows its origin |
+| **Word-boundary overlap** | Words cut between chunks | `find(' ', overlap_start)` |
+| **fcntl flock** | Two sync processes corrupt state | POSIX file locking |
+| **Angle bracket protection** | List\<String\> killed by HTML cleaner | code/pre/tt protection phase |
 
 ---
 
-## 8. Ссылки
+## 8. Links
 
-- Репозиторий: https://github.com/Wendigooor/knowledge-base-kit
+- Repository: https://github.com/Wendigooor/knowledge-base-kit
 - ATM runs: 3 x 6/6 gates = 18/18 total
-- Demo script: `/tmp/kbk-v02-demo.py`
+- Runnable demo: `python3.11 docs/KBK_DEMO_RUN.py`
 
 ```
 pip install git+https://github.com/Wendigooor/knowledge-base-kit.git

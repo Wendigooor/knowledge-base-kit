@@ -1,47 +1,37 @@
 # KBK v0.2 — Enterprise Semantic Index
 
-> Knowledge Base Kit: умный индекс корпоративных знаний.
-> Pull + Allowlist. Два выхода: MCP Server (LLM) + Confluence Showcase (Human).
+> Knowledge Base Kit: an intelligent index of enterprise knowledge.
+> Pull + Allowlist. Two outputs: MCP Server (for LLMs) + Confluence Showcase (for humans).
 
 ---
 
 ## Why
 
-**Проблема:** Энтерпрайз-знания размазаны по Confluence, Jira и GitLab. Попытки заставить людей писать в новые системы проваливаются. LLM-агенты задыхаются от HTML-мусора и галлюцинируют, а люди не могут найти актуальные архитектурные решения.
+**Problem:** Enterprise knowledge is scattered across Confluence, Jira, and GitLab. Trying to get people to write in new systems fails every time. LLM agents choke on HTML garbage and hallucinate, while humans can't find current architectural decisions.
 
-**Решение:** KBK — это **индекс**, не хранилище. Source of truth остаётся в Confluence/Jira/Git. Никаких вебхуков. Только **Pull** по команде из **белого списка** (Allowlist).
+**Solution:** KBK is an **index**, not a store. The source of truth stays in Confluence/Jira/Git. No webhooks. Only **Pull** on demand from a **whitelist** (Allowlist) defined in `targets.yaml`.
 
-## Архитектура
+## Architecture
 
 ```
-  [Confluence] ──────┐
-  [GitLab] ───────────┤─── kbk sync ──── [State Tracker] ─── [Indexer AI Pipeline]
-  [Jira] ─────────────┘       │                                       │
-                              ├─ SHA-256 diff (skip unchanged)         ├─ clean HTML
-                              └─ delete orphans                        ├─ LLM summarize
-                                                                       ├─ classify tags
-                                                                       ├─ chunk (1k tokens)
-                                                                       └─ embed to ChromaDB
-                                                                              │
-                                    ┌─────────────────────────────────────────┘
-                                    ▼
-                    ┌──────────────────────────────┐
-                    │         ChromaDB              │
-                    │  (vectors + metadata)         │
-                    └──────┬───────────────┬────────┘
-                           │               │
-                           ▼               ▼
-                 ┌────────────┐    ┌──────────────┐
-                 │  MCP Server │    │   Showcase    │
-                 │  (LLM API)  │    │  (Confluence) │
-                 │  search     │    │  read-only    │
-                 │  list       │    │  index page   │
-                 └────────────┘    └──────────────┘
+[Confluence] --------+
+[GitLab] ------------+--- kbk sync --- [StateTracker SHA-256] --- [Indexer AI Pipeline]
+[Jira] --------------+       |                                       |
+                             |-- SHA-256 diff (skip unchanged)        |-- clean HTML
+                             +-- delete orphans                       |-- LLM summarize + classify
+                                                                      |-- chunk (1k tokens)
+                                                                      +-- embed to ChromaDB
+                                                                             |
+                                                             +---------------+------------+
+                                                             |                            |
+                                                       MCP Server               Confluence Showcase
+                                                       (for Cursor,              (Read-Only index page)
+                                                        Claude Desktop)           for humans
 ```
 
-## Данные
+## Data
 
-### Белый список (targets.yaml)
+### Whitelist (targets.yaml)
 
 ```yaml
 targets:
@@ -54,112 +44,144 @@ targets:
     path: "docs/runbooks/"
 ```
 
-Только эти источники индексируются. Никакого мусора.
+Only these sources are indexed. No trash, no draft pages, no noise.
 
-### Модель данных (IndexedChunk)
+### Data Model (IndexedChunk)
 
-```python
-@dataclass
-class IndexedChunk:
-    id: str                  # Hash(url + chunk_index)
-    source_url: str          # Оригинал (с якорем)
-    content: str             # Очищенный текст чанка
-    summary: str             # LLM-суммаризация документа
-    tags: list[str]          # Классификация
-    access_group: str        # ACL
-    content_hash: str        # SHA-256 для StateTracker
-    collection: str          # Группировка (space, repo)
-```
+| Field | Description |
+|-------|-------------|
+| `id` | Deterministic: `sha256(source_url:content_hash:collection)` |
+| `source_url` | Link to the original document |
+| `content` | Cleaned text chunk (no HTML) |
+| `summary` | LLM-generated summary (2-3 sentences) |
+| `tags` | LLM-classified tags |
+| `access_group` | ACL label (e.g. "public", "finance") |
+| `content_hash` | SHA-256 of the raw document for dedup |
+| `collection` | Grouping (arch, runbooks, platform) |
 
 ### State Tracker
 
-SHA-256 хэш каждого документа. Если не изменился — **скип**. Экономит LLM-затраты и время.
+SHA-256 hash of each document. If unchanged — **skip**. Saves LLM costs and time.
+
+```
+First sync:  3 docs indexed, 12 chunks, $0.0021 LLM cost
+Second sync: 0 docs indexed (all skipped), $0.0000 cost
+```
 
 ## CLI
 
-| Команда | Назначение |
-|---------|-----------|
-| `kbk init` | Инициализация: ~/.kbk/, ChromaDB, StateTracker |
-| `kbk sync` | Pull + Diff + ETL + Embed (весь пайплайн) |
-| `kbk serve` | MCP-сервер для LLM (Claude Desktop, Cursor) |
-| `kbk build-showcase` | Генерация Confluence Read-Only витрины |
-| `kbk search` | Семантический поиск по индексу |
-| `kbk status` | Статистика индекса |
+| Command | Description |
+|---------|-------------|
+| `kbk init` | Initialize: creates `~/.kbk/`, ChromaDB, StateTracker |
+| `kbk sync` | Pull + Diff + ETL + Embed (full pipeline). `--dry-run` for cost preview |
+| `kbk serve` | MCP server (stdio) for Cursor / Claude Desktop |
+| `kbk build-showcase` | Generate Read-Only Confluence showcase or Markdown |
+| `kbk search <query>` | Semantic search across the index |
+| `kbk status` | Index statistics |
 
-## Компоненты
+## Components
 
-| Модуль | Назначение |
-|--------|-----------|
-| `kbk/models.py` | IndexedChunk, SourceTarget |
-| `kbk/config.py` | KBKConfig, загрузка конфига |
-| `kbk/store.py` | ChromaDB upsert/search/delete/stats |
-| `kbk/state.py` | StateTracker (SHA-256 dedup) |
-| `kbk/indexer.py` | ETL pipeline: clean → summarize → classify → chunk → embed |
-| `kbk/connectors/confluence.py` | Confluence REST API, rate limiting, diffing |
-| `kbk/mcp_server.py` | MCP protocol server (stdio) |
-| `kbk/showcase.py` | Confluence Showcase builder |
-| `kbk/cli.py` | Click CLI (6 команд) |
+| Module | Purpose |
+|--------|---------|
+| `kbk/models.py` | IndexedChunk, SourceTarget data models |
+| `kbk/config.py` | KBKConfig, YAML config loader |
+| `kbk/store.py` | ChromaDB wrapper: upsert/search/delete/stats |
+| `kbk/state.py` | StateTracker: SHA-256 dedup with atomic writes + file locking |
+| `kbk/indexer.py` | AI pipeline: clean HTML → LLM (summarize+classify one call) → chunk → embed |
+| `kbk/connectors/confluence.py` | Confluence REST API client with rate limiting, pagination, orphan detection |
+| `kbk/mcp_server.py` | MCP protocol server (stdio): search_knowledge, get_document_summary |
+| `kbk/showcase.py` | Confluence Showcase: generates Read-Only index page with expand/collapse sections |
+| `kbk/cli.py` | Click CLI: init, sync, serve, build-showcase, search, status |
 
-## Установка
+## Edge Cases Handled
+
+| Edge Case | Solution |
+|-----------|----------|
+| API Rate Limits (Confluence) | Exponential backoff (2^attempt) |
+| LLM Cost Runaway | StateTracker dedup + --dry-run + single LLM call per doc |
+| Context Loss (chunking) | Summary attached to each chunk, word-boundary overlap |
+| HTML Garbage | Code/pre/tt protection, ac:macro removal, HTML entities |
+| Corrupt State File | Atomic write (tmp+replace), corrupt backup to .corrupt.bak |
+| Short Content (<200 chars) | Skip LLM, fallback to truncation |
+| Empty Content | Early return with empty list |
+| XSS (Showcase) | html.escape() on all user data |
+| ACL Bypass | access_group enforced at store.search + MCP level |
+| Concurrent Sync | POSIX fcntl.flock — second process gets "already running" |
+| Confluence API Failure | Logged with error code, re-raised (not silent None) |
+| LLM JSON Parsing | 5-strategy extraction: fences, balanced braces, trailing commas, Python→JSON nulls |
+| Orphan Documents | Reconciliation: list_known_urls → diff → delete_chunks |
+
+## Installation
 
 ```bash
 pip install git+https://github.com/Wendigooor/knowledge-base-kit.git
 ```
 
-Или локально:
+Or locally:
 ```bash
 git clone git@github.com:Wendigooor/knowledge-base-kit.git
 cd knowledge-base-kit
 pip install -e .
 ```
 
-## Использование
+## Usage
 
 ```bash
-# Инициализация
+# Initialize
 kbk init
 
-# Настройка белого списка
+# Configure whitelist
 vim ~/.kbk/targets.yaml
 
-# Запуск индексации
+# Index documents
 kbk sync
 
-# Поиск
-kbk search "как задеплоить payment"
+# Search
+kbk search "how to deploy payment service"
 
-# MCP сервер (для Cursor / Claude Desktop)
+# MCP server (for Cursor / Claude Desktop)
 kbk serve
 
-# Confluence витрина
+# Confluence showcase
 kbk build-showcase
 
-# Статус
+# Status
 kbk status
 ```
 
-## Демо-сценарий
+## Demo
 
-1. Показать хаос в Confluence (разрозненные спейсы)
-2. `kbk sync` — красивый прогресс с rich прогресс-барами
-3. **Wow 1:** Cursor → MCP → "как устроен флоу оплаты?" → идеальный ответ
-4. **Wow 2:** `kbk build-showcase` → Confluence → идеальная страница-витрина
+See `docs/KBK_DEMO_v02.md` for a complete walkthrough with real data (Confluence ADR + GitLab README → index → search → MCP response).
 
-## Разработка
+Or run it:
+```bash
+python3.11 docs/KBK_DEMO_RUN.py
+```
+
+## Development
 
 ```bash
 pip install -e ".[dev]"
-python tests/test_smoke.py
+python3.11 tests/test_smoke.py
 ```
 
-## Статус
+## ATM Runs
 
-✅ v0.2 — Pull + Allowlist, 11/11 тестов, ATM berserk (6/6 gates)  
-🔲 v0.3 — GitLab connector, HTTP MCP, инкрементальный showcase  
-🔲 v0.4 — Backstage dashboard, Slack AI assistant
+| Run | Gates | Description |
+|-----|-------|-------------|
+| `kbk-v02` | 6/6 | Initial implementation |
+| `kbk-v02-fixes` | 6/6 | 15 fixes from GLM-5.1 + Kimi K2.5 review |
+| `kbk-v02-review-fixes` | 6/6 | 7 fixes from Gemini code review |
+| **Total** | **18/18** | |
 
-## Ссылки
+## Roadmap
 
-- Репозиторий: [github.com/Wendigooor/knowledge-base-kit](https://github.com/Wendigooor/knowledge-base-kit)
-- AGENTS.md: Правила для агентов
-- ATM run: `kbk-v02` (6/6 gates)
+- [ ] v0.3: GitLab connector, HTTP MCP, incremental showcase
+- [ ] v0.4: Backstage dashboard, Slack AI assistant, Qdrant/Milvus support
+
+## Links
+
+- Repository: [github.com/Wendigooor/knowledge-base-kit](https://github.com/Wendigooor/knowledge-base-kit)
+- Architecture: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- Demo: [docs/KBK_DEMO_v02.md](docs/KBK_DEMO_v02.md)
+- AGENTS.md: Agent instructions for autonomous development
