@@ -1,93 +1,155 @@
-"""Indexer — ETL pipeline for KBK v2.
-
-Converts raw source content → clean text → LLM summary → chunks → embeddings → ChromaDB.
-"""
+"""AI Pipeline for KBK — clean, summarize, chunk, classify."""
 from __future__ import annotations
+import json
+import re
+import urllib.request
+from typing import Optional
 
-from kbk.document import IndexedDocument
+from kbk.models import IndexedChunk
 from kbk.store import KnowledgeStore
+from kbk.state import StateTracker
 
 
 class Indexer:
-    """Processes raw source content into indexed documents.
+    """ETL pipeline: clean HTML → LLM summarize → classify → chunk → embed."""
 
-    Each document is summarized by LLM, classified with tags,
-    split into chunks, embedded, and stored in ChromaDB.
-    """
-
-    def __init__(self, store: KnowledgeStore):
+    def __init__(self, store: KnowledgeStore, state: StateTracker,
+                 llm_api_key: str = "", llm_model: str = "gpt-4o-mini",
+                 llm_base_url: str = "https://api.openai.com/v1"):
         self.store = store
+        self.state = state
+        self.llm_api_key = llm_api_key
+        self.llm_model = llm_model
+        self.llm_base_url = llm_base_url.rstrip("/")
+        self.cost_log: list[dict] = []
 
-    def index(self, raw_text: str, source_url: str, source_type: str,
-              collection: str = "unclassified", metadata: dict = None) -> IndexedDocument:
-        """Process and index a document from a source.
+    def clean_html(self, html: str) -> str:
+        """Strip Confluence HTML to clean text."""
+        text = re.sub(r'<ac:[^>]+>[^<]*</ac:[^>]+>', '', html)
+        text = re.sub(r'<[^>]+>', ' ', text)
+        text = re.sub(r'&nbsp;', ' ', text)
+        text = re.sub(r'\s+', ' ', text).strip()
+        return text
 
-        Args:
-            raw_text: Original content from the source.
-            source_url: URL pointing to the original.
-            source_type: confluence | jira | git | slack.
-            collection: Target ChromaDB collection.
-            metadata: Additional metadata (author, project, access_group, etc.).
+    def summarize(self, text: str, title: str = "") -> str:
+        """Call LLM to extract a concise summary. Falls back to truncation."""
+        if not self.llm_api_key or len(text) < 200:
+            preview = text[:300].strip()
+            return preview + "..." if len(text) > 300 else preview
 
-        Returns:
-            IndexedDocument stored in ChromaDB.
-        """
-        cleaned = self._clean(raw_text)
-        summary = self._summarize(cleaned)
-        tags = self._classify(cleaned, summary)
-        chunks = self._chunk(summary)
-        _ = self._embed(chunks)
+        prompt = f"Summarize this document in 2-3 sentences. Title: {title}\n\n{text[:4000]}"
+        payload = {
+            "model": self.llm_model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 200, "temperature": 0.3,
+        }
+        try:
+            data = json.dumps(payload).encode()
+            req = urllib.request.Request(
+                f"{self.llm_base_url}/chat/completions",
+                data=data,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.llm_api_key}",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                result = json.loads(resp.read().decode())
+                content = result["choices"][0]["message"]["content"]
+                usage = result.get("usage", {})
+                self.cost_log.append({
+                    "model": self.llm_model,
+                    "prompt_tokens": usage.get("prompt_tokens", 0),
+                    "completion_tokens": usage.get("completion_tokens", 0),
+                })
+                return content.strip()
+        except Exception:
+            return text[:300] + "..." if len(text) > 300 else text
 
-        doc = IndexedDocument(
-            summary=summary,
-            tags=tags,
-            metadata={
-                "source_url": source_url,
-                "source_type": source_type,
-                **(metadata or {}),
-            },
-            collection=collection,
-            chunk_count=len(chunks),
-        )
-        self.store.upsert(doc)
-        return doc
-
-    def _clean(self, raw: str) -> str:
-        """Strip HTML, Jira markup, Confluence macros."""
-        import re
-        text = re.sub(r'<[^>]+>', '', raw)
-        text = re.sub(r'\{[^}]+\}', '', text)
-        text = re.sub(r'\n{3,}', '\n\n', text)
-        return text.strip()
-
-    def _summarize(self, text: str) -> str:
-        """LLM-based summarization: extract key points in 100-200 tokens.
-        
-        In v0.1, uses truncation. In production, calls an LLM.
-        """
-        if len(text) <= 1000:
-            return text
-        return text[:1000] + "..."
-
-    def _classify(self, text: str, summary: str) -> list[str]:
-        """LLM-based classification: extract tags from content."""
-        import re
+    def classify(self, text: str, summary: str) -> list[str]:
+        """Extract tags from text. Uses LLM if available, else heuristics."""
+        if self.llm_api_key:
+            prompt = f"Extract 3-5 tags from this document. Return ONLY a JSON array of strings.\n\n{summary}"
+            payload = {
+                "model": self.llm_model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 100, "temperature": 0.1,
+            }
+            try:
+                data = json.dumps(payload).encode()
+                req = urllib.request.Request(
+                    f"{self.llm_base_url}/chat/completions",
+                    data=data, headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {self.llm_api_key}",
+                    },
+                )
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    result = json.loads(resp.read().decode())
+                    content = result["choices"][0]["message"]["content"].strip()
+                    try:
+                        return json.loads(content)
+                    except json.JSONDecodeError:
+                        return re.findall(r'\w+', content)[:5]
+            except Exception:
+                pass
         words = re.findall(r'\b[A-Z][a-z]+(?:\s[A-Z][a-z]+)*\b', summary)
-        return list(set(words[:8]))
+        return list(set(w.lower() for w in words[:8]))
 
-    def _chunk(self, text: str, chunk_size: int = 512) -> list[str]:
-        """Split text into overlapping chunks for embedding."""
-        words = text.split()
+    def chunk(self, text: str, chunk_size: int = 1000, overlap: int = 100) -> list[str]:
+        """Split text into overlapping chunks anchored to headings."""
+        try:
+            import nltk
+            try:
+                sentences = nltk.sent_tokenize(text)
+            except LookupError:
+                sentences = text.replace('\n', ' ').split('. ')
+        except ImportError:
+            sentences = text.replace('\n', ' ').split('. ')
         chunks = []
-        for i in range(0, len(words), chunk_size):
-            chunk = " ".join(words[i:i + chunk_size])
-            if chunk:
-                chunks.append(chunk)
+        current = ""
+        for s in sentences:
+            if len(current) + len(s) > chunk_size and current:
+                chunks.append(current.strip())
+                current = current[-overlap:] + " " + s
+            else:
+                current += " " + s
+        if current.strip():
+            chunks.append(current.strip())
         return chunks or [text]
 
-    def _embed(self, chunks: list[str]) -> list:
-        """Generate embeddings for chunks.
-        
-        In v0.1, no-op. In production, calls embedding model.
-        """
+    def process_document(self, url: str, raw_html: str, title: str = "",
+                         access_group: str = "public",
+                         collection: str = "unclassified",
+                         content_hash: str = "") -> list[IndexedChunk]:
+        """Process a single document through the ETL pipeline."""
+        cleaned = self.clean_html(raw_html)
+        summary = self.summarize(cleaned, title)
+        tags = self.classify(cleaned, summary)
+        chunks_text = self.chunk(cleaned)
+
+        chunks = []
+        for i, chunk_text in enumerate(chunks_text):
+            chunk = IndexedChunk(
+                source_url=url,
+                content=chunk_text,
+                summary=summary,
+                tags=tags,
+                access_group=access_group,
+                content_hash=content_hash or StateTracker.hash_content(raw_html),
+                collection=collection,
+            )
+            chunk.id = StateTracker.hash_content(f"{url}:chunk:{i}")
+            self.store.upsert_chunk(chunk)
+            chunks.append(chunk)
         return chunks
+
+    @property
+    def total_cost_estimate(self) -> dict:
+        total_prompt = sum(c.get("prompt_tokens", 0) for c in self.cost_log)
+        total_completion = sum(c.get("completion_tokens", 0) for c in self.cost_log)
+        return {
+            "prompt_tokens": total_prompt,
+            "completion_tokens": total_completion,
+            "estimated_cost_usd": round(total_prompt * 0.00015 / 1000 + total_completion * 0.0006 / 1000, 4),
+        }

@@ -1,0 +1,12 @@
+# KBK whitelisted sources — v0.2 Pull + Allowlist
+# Add targets here and run `kbk sync` to index them.
+targets:
+  - type: confluence
+    location: "ARCH"
+    filter_query: "label = 'approved' OR label = 'adr'"
+    access_group: "public"
+
+  - type: confluence
+    location: "ENG"
+    filter_query: "label = 'runbook'"
+    access_group: "public"

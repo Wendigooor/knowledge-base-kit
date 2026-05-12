@@ -1,4 +1,4 @@
-"""Smoke tests for KBK v2 — Enterprise Semantic Index."""
+"""Smoke tests for KBK v0.2 — Enterprise Semantic Index."""
 import os
 import sys
 import tempfile
@@ -6,33 +6,40 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from kbk.document import IndexedDocument
+from kbk.models import IndexedChunk
 from kbk.config import KBKConfig
 from kbk.store import KnowledgeStore
+from kbk.state import StateTracker
 from kbk.indexer import Indexer
 
 
-def test_document_create():
-    doc = IndexedDocument(summary="API Gateway on K8s", tags=["architecture", "k8s"])
-    assert doc.id
-    assert doc.summary == "API Gateway on K8s"
-    assert "k8s" in doc.tags
-    print("✅ IndexedDocument create")
+def test_chunk_create():
+    c = IndexedChunk(source_url="https://example.com/page", content="test", tags=["a"])
+    assert c.id
+    assert c.source_url == "https://example.com/page"
+    assert "a" in c.tags
+    print("✅ Chunk create")
 
 
-def test_document_source_url():
-    doc = IndexedDocument(metadata={"source_url": "https://confluence/page/123"})
-    assert doc.source_url == "https://confluence/page/123"
-    print("✅ IndexedDocument source_url")
+def test_chunk_from_dict():
+    data = {"id": "abc", "source_url": "https://x", "content": "hello", "tags": ["t1"]}
+    c = IndexedChunk.from_dict(data)
+    assert c.id == "abc"
+    assert c.content == "hello"
+    print("✅ Chunk from_dict")
 
 
-def test_document_from_dict():
-    data = {"id": "abc123", "summary": "test", "tags": ["a"], "collection": "arch"}
-    doc = IndexedDocument.from_dict(data)
-    assert doc.id == "abc123"
-    assert doc.summary == "test"
-    assert doc.collection == "arch"
-    print("✅ IndexedDocument from_dict")
+def test_state_tracker():
+    with tempfile.TemporaryDirectory() as tmp:
+        state = StateTracker(os.path.join(tmp, "state.json"))
+        url = "https://example.com/doc"
+        h = StateTracker.hash_content("content v1")
+        assert state.has_changed(url, h) is True
+        state.mark_indexed(url, h, ["chunk1", "chunk2"])
+        assert state.has_changed(url, h) is False
+        h2 = StateTracker.hash_content("content v2")
+        assert state.has_changed(url, h2) is True
+    print("✅ State tracker hash/diff")
 
 
 def test_store_init():
@@ -48,36 +55,24 @@ def test_store_upsert_and_search():
     with tempfile.TemporaryDirectory() as tmp:
         cfg = KBKConfig(db_path=tmp, top_k=5)
         store = KnowledgeStore(cfg)
-        doc = IndexedDocument(summary="PostgreSQL migration guide", tags=["db", "postgres"], collection="arch")
-        store.upsert(doc)
+        c = IndexedChunk(source_url="https://x", content="PostgreSQL migration guide", tags=["db"], collection="arch")
+        store.upsert_chunk(c)
         assert store.count("arch") == 1
         results = store.search("postgres", collection_filter="arch")
         assert len(results) >= 1
-        assert results[0].summary == doc.summary
+        assert "postgres" in results[0].content.lower()
     print("✅ Store upsert & search")
-
-
-def test_store_get():
-    with tempfile.TemporaryDirectory() as tmp:
-        cfg = KBKConfig(db_path=tmp)
-        store = KnowledgeStore(cfg)
-        doc = IndexedDocument(summary="Test doc", collection="test")
-        store.upsert(doc)
-        retrieved = store.get(doc.id, "test")
-        assert retrieved is not None
-        assert retrieved.summary == "Test doc"
-    print("✅ Store get")
 
 
 def test_store_delete():
     with tempfile.TemporaryDirectory() as tmp:
         cfg = KBKConfig(db_path=tmp)
         store = KnowledgeStore(cfg)
-        doc = IndexedDocument(summary="Delete me", collection="test")
-        store.upsert(doc)
-        assert store.delete(doc.id, "test") is True
+        c = IndexedChunk(source_url="https://x", content="delete me", collection="test")
+        store.upsert_chunk(c)
+        store.delete_chunks([c.id], "test")
         assert store.count("test") == 0
-    print("✅ Store delete")
+    print("✅ Store delete chunks")
 
 
 def test_store_stats():
@@ -85,66 +80,75 @@ def test_store_stats():
         cfg = KBKConfig(db_path=tmp)
         store = KnowledgeStore(cfg)
         stats = store.get_stats()
-        assert "collections" in stats
-        assert "total" in stats
         assert stats["total"] == 0
-        doc = IndexedDocument(summary="Doc 1", collection="arch")
-        store.upsert(doc)
+        store.upsert_chunk(IndexedChunk(source_url="https://x", content="doc 1", collection="arch"))
         stats = store.get_stats()
         assert stats["total"] == 1
     print("✅ Store stats")
 
 
 def test_indexer_clean():
-    store = KnowledgeStore(KBKConfig(db_path="/tmp/_kbk_test_indexer"))
-    indexer = Indexer(store)
-    cleaned = indexer._clean("<html><body><p>Hello</p></body></html>")
+    store = KnowledgeStore(KBKConfig(db_path="/tmp/_kbk_test_clean"))
+    state = StateTracker("/tmp/_kbk_test_clean_state.json")
+    idx = Indexer(store, state)
+    cleaned = idx.clean_html("<html><body><p>Hello</p></body></html>")
     assert "Hello" in cleaned
     assert "<html>" not in cleaned
-    print("✅ Indexer clean")
+    print("✅ Indexer clean HTML")
 
 
 def test_indexer_chunk():
-    store = KnowledgeStore(KBKConfig(db_path="/tmp/_kbk_test_indexer_chunk"))
-    indexer = Indexer(store)
-    text = "word " * 2000
-    chunks = indexer._chunk(text, chunk_size=512)
-    assert len(chunks) >= 3
+    store = KnowledgeStore(KBKConfig(db_path="/tmp/_kbk_test_chunk"))
+    state = StateTracker("/tmp/_kbk_test_chunk_state.json")
+    idx = Indexer(store, state)
+    # Split on periods to create sentence boundaries
+    text = ". ".join(["word"] * 200)
+    chunks = idx.chunk(text, chunk_size=10)
+    assert len(chunks) >= 2
     print("✅ Indexer chunk")
 
 
 def test_indexer_full_flow():
     with tempfile.TemporaryDirectory() as tmp:
-        cfg = KBKConfig(db_path=tmp)
+        cfg = KBKConfig(db_path=tmp, state_path=os.path.join(tmp, "state.json"))
         store = KnowledgeStore(cfg)
-        indexer = Indexer(store)
-        doc = indexer.index(
-            raw_text="<h1>API Gateway Migration</h1><p>Moving to K8s for scalability</p>",
-            source_url="https://confluence/page/123",
-            source_type="confluence",
-            collection="architecture",
+        state = StateTracker(cfg.state_path)
+        idx = Indexer(store, state, llm_api_key="")
+        doc_hash = StateTracker.hash_content("<h1>Test</h1><p>API Gateway on K8s</p>")
+        chunks = idx.process_document(
+            url="https://confluence/page/123",
+            raw_html="<h1>Test</h1><p>API Gateway on K8s</p>",
+            title="API Gateway Migration",
+            content_hash=doc_hash,
         )
-        assert doc.id
-        assert "API" in doc.summary or "Migration" in doc.summary
-        assert doc.source_url == "https://confluence/page/123"
-        assert doc.source_type == "confluence"
-        assert store.count("architecture") == 1
+        assert len(chunks) >= 1
+        assert store.count("unclassified") >= 1
+        results = store.search("api gateway", collection_filter="unclassified")
+        assert len(results) >= 1
     print("✅ Indexer full flow")
+
+
+def test_targets_config():
+    from kbk.config import load_targets
+    targets = load_targets("targets.yaml")
+    assert len(targets) >= 1
+    assert targets[0]["type"] in ("confluence", "gitlab")
+    print("✅ Targets config")
 
 
 if __name__ == "__main__":
     tests = [
-        test_document_create,
-        test_document_source_url,
-        test_document_from_dict,
+        test_chunk_create,
+        test_chunk_from_dict,
+        test_state_tracker,
         test_store_init,
         test_store_upsert_and_search,
-        test_store_get,
         test_store_delete,
         test_store_stats,
         test_indexer_clean,
         test_indexer_chunk,
         test_indexer_full_flow,
+        test_targets_config,
     ]
     passed = 0
     for t in tests:
@@ -152,6 +156,8 @@ if __name__ == "__main__":
             t()
             passed += 1
         except Exception as e:
+            import traceback
             print(f"❌ {t.__name__}: {e}")
+            traceback.print_exc()
     print(f"\n{passed}/{len(tests)} tests passed")
     sys.exit(0 if passed == len(tests) else 1)

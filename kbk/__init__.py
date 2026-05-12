@@ -1,1 +1,1 @@
-"""KBK v2 — Enterprise Semantic Index."""
+"""KBK v0.2 — Enterprise Semantic Index. Pull + Allowlist."""
