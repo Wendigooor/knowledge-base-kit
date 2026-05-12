@@ -1,5 +1,6 @@
 """State tracker for KBK — SHA-256 hash-based dedup."""
 from __future__ import annotations
+import fcntl
 import json
 import hashlib
 import logging
@@ -20,6 +21,8 @@ class StateTracker:
 
     Uses atomic write (temp file + replace) to prevent corruption.
     Backs up corrupt state files before resetting.
+    Uses POSIX file locking (fcntl.flock) to prevent concurrent
+    write conflicts from parallel kbk sync processes.
     """
 
     def __init__(self, state_path: str):
@@ -27,7 +30,39 @@ class StateTracker:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._data: dict[str, dict] = {}
         self._dirty = False  # Track unsaved changes for batch mode
+        self._lock_file = self.path.with_suffix(".lock")
+        self._lock_fd = None
         self._load()
+
+    def acquire_lock(self, blocking: bool = True) -> bool:
+        """Acquire an exclusive lock on the state file.
+
+        Prevents concurrent kbk sync processes from corrupting state.
+        Returns True if lock acquired, False if non-blocking and busy.
+        """
+        try:
+            self._lock_fd = self._lock_file.open("w")
+            flags = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
+            fcntl.flock(self._lock_fd, flags)
+            return True
+        except (IOError, OSError, BlockingIOError):
+            self._lock_fd = None
+            return False
+
+    def release_lock(self):
+        """Release the file lock."""
+        if self._lock_fd is not None:
+            try:
+                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+                self._lock_fd.close()
+            except (IOError, OSError):
+                pass
+            finally:
+                self._lock_fd = None
+        try:
+            self._lock_file.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     def _load(self):
         if self.path.exists():
@@ -46,13 +81,15 @@ class StateTracker:
             self._data = {}
 
     def _save(self):
-        """Atomic write: write to temp file, then rename."""
+        """Atomic write: write to temp file, then rename.
+
+        Must be called while holding the lock (acquire_lock).
+        """
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(
             json.dumps(self._data, indent=_DEFAULT_INDENT, ensure_ascii=False),
             encoding="utf-8",
         )
-        # Atomic replace (POSIX atomic on same filesystem)
         tmp.replace(self.path)
         self._dirty = False
 
@@ -67,7 +104,10 @@ class StateTracker:
         return existing.get("hash") != content_hash
 
     def mark_indexed(self, url: str, content_hash: str, chunk_ids: list[str] = None):
-        """Mark a document as indexed with its content hash."""
+        """Mark a document as indexed with its content hash.
+
+        Must be called while holding the lock.
+        """
         self._data[url] = {
             "hash": content_hash,
             "chunk_ids": chunk_ids or [],
@@ -76,7 +116,10 @@ class StateTracker:
         self._save()
 
     def remove(self, url: str):
-        """Remove a document from the tracker (e.g., if deleted at source)."""
+        """Remove a document from the tracker (e.g., if deleted at source).
+
+        Must be called while holding the lock.
+        """
         self._data.pop(url, None)
         self._dirty = True
         self._save()

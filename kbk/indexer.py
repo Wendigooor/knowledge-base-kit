@@ -21,6 +21,7 @@ _LLM_TIMEOUT = 30  # seconds
 _LLM_RETRIES = 2
 _SUMMARY_MAX_CHARS = 4000
 _PREVIEW_MAX_CHARS = 300
+_TAG_MAX = 10
 
 
 class Indexer:
@@ -36,18 +37,47 @@ class Indexer:
         self.llm_base_url = llm_base_url.rstrip("/")
         self.cost_log: list[dict] = []
 
+    # ── HTML cleaning ──────────────────────────────────────────────
+
     def clean_html(self, html: str) -> str:
-        """Strip Confluence HTML to clean text."""
-        # Remove Confluence-specific macros (ac: tags)
-        text = re.sub(r'<ac:[^>]+>[^<]*</ac:[^>]+>', '', html)
-        # Strip all remaining HTML tags
+        """Strip Confluence HTML, preserving code/angle brackets.
+
+        HTML tags like <ac:...> are removed entirely.
+        Remaining angle brackets (< >) from inline code are preserved.
+        Code blocks (<code>, <pre>) are detected and angle brackets inside
+        them are kept intact.
+        """
+        # Protect code blocks: replace internal <> with placeholders
+        text = html
+
+        # Protect <code> blocks
+        def protect_code(m):
+            inner = m.group(1)
+            protected = inner.replace("<", "<<<LT>>>").replace(">", ">>>GT>>>")
+            return f" {protected} "
+
+        text = re.sub(r'<code>(.*?)</code>', protect_code, text, flags=re.DOTALL)
+        text = re.sub(r'<pre>(.*?)</pre>', protect_code, text, flags=re.DOTALL)
+        # Also protect inline code (single backtick style in HTML)
+        text = re.sub(r'<tt>(.*?)</tt>', protect_code, text, flags=re.DOTALL)
+
+        # Remove Confluence-specific macros
+        text = re.sub(r'<ac:[^>]+>[^<]*</ac:[^>]+>', '', text)
+        # Strip remaining HTML tags
         text = re.sub(r'<[^>]+>', ' ', text)
+
+        # Restore angle brackets in code
+        text = text.replace("<<<LT>>>", "<").replace(">>>GT>>>", ">")
+
+        # HTML entities
         text = re.sub(r'&nbsp;', ' ', text)
         text = re.sub(r'&amp;', '&', text)
         text = re.sub(r'&lt;', '<', text)
         text = re.sub(r'&gt;', '>', text)
         text = re.sub(r'\s+', ' ', text).strip()
         return text
+
+    # ── LLM calls ──────────────────────────────────────────────────
 
     def _call_llm(self, prompt: str, max_tokens: int = 200,
                   temperature: float = 0.1) -> str:
@@ -112,10 +142,83 @@ class Indexer:
 
         raise LLMError(f"LLM call failed after {_LLM_RETRIES + 1} attempts: {last_error}") from last_error
 
+    # ── Robust JSON extraction from LLM output ─────────────────────
+
+    @staticmethod
+    def _extract_json(text: str) -> Optional[dict]:
+        """Robust JSON extraction from LLM response.
+
+        Handles: markdown fences, trailing commas, unescaped quotes,
+        newlines in strings, Python-style None/True/False.
+        Returns None if extraction fails.
+        """
+        if not text:
+            return None
+
+        # Try direct parse first
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+
+        # Strip markdown fences
+        cleaned = re.sub(r'^```(?:json)?\s*\n?', '', text, flags=re.MULTILINE)
+        cleaned = re.sub(r'\n?```\s*$', '', cleaned, flags=re.MULTILINE)
+        cleaned = cleaned.strip()
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            pass
+
+        # Find JSON object with balanced braces
+        brace_depth = 0
+        start = -1
+        for i, ch in enumerate(cleaned):
+            if ch == '{':
+                if start == -1:
+                    start = i
+                brace_depth += 1
+            elif ch == '}':
+                brace_depth -= 1
+                if brace_depth == 0 and start >= 0:
+                    candidate = cleaned[start:i + 1]
+                    break
+        else:
+            # No balanced braces found
+            return None
+
+        # Try to fix common issues
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+
+        # Try with trailing comma removal
+        fixed = re.sub(r',\s*}', '}', candidate)
+        fixed = re.sub(r',\s*]', ']', fixed)
+        try:
+            return json.loads(fixed)
+        except json.JSONDecodeError:
+            pass
+
+        # Try replacing Python None/True/False
+        fixed = re.sub(r'\bNone\b', 'null', candidate)
+        fixed = re.sub(r'\bTrue\b', 'true', fixed)
+        fixed = re.sub(r'\bFalse\b', 'false', fixed)
+        fixed = re.sub(r',\s*}', '}', fixed)
+        fixed = re.sub(r',\s*]', ']', fixed)
+        try:
+            return json.loads(fixed)
+        except json.JSONDecodeError:
+            pass
+
+        return None
+
     def _summarize_and_classify(self, text: str, title: str = "") -> tuple[str, list[str]]:
         """Single LLM call to get both summary and tags.
 
-        Falls back to truncation if LLM unavailable.
+        Falls back to truncation + heuristic tags if LLM unavailable.
+        Uses robust JSON extraction with multiple fallback strategies.
         """
         if not self.llm_api_key or len(text) < 200:
             preview = text[:_PREVIEW_MAX_CHARS].strip()
@@ -143,35 +246,35 @@ class Indexer:
             summary = preview + "..." if len(text) > _PREVIEW_MAX_CHARS else preview
             return summary, []
 
-        # Parse structured output
-        json_match = re.search(r'\{.*\}', response, re.DOTALL)
-        if json_match:
-            try:
-                parsed = json.loads(json_match.group())
-                summary = parsed.get("summary", "")[:500]
-                tags = parsed.get("tags", [])
-                return summary, tags[:10]
-            except json.JSONDecodeError:
-                pass
+        parsed = self._extract_json(response)
+        if parsed:
+            summary = str(parsed.get("summary", ""))[:500]
+            tags = list(parsed.get("tags", []))[:_TAG_MAX]
+            if summary:
+                return summary, tags
 
-        # Fallback
+        # Fallback: truncation + heuristic tags
+        logger.warning("LLM output not parseable as JSON. Response preview: %s...", response[:100])
         preview = text[:_PREVIEW_MAX_CHARS].strip()
         summary = preview + "..." if len(text) > _PREVIEW_MAX_CHARS else preview
         words = re.findall(r'\b[A-Z][a-z]+(?:\s[A-Z][a-z]+)*\b', text)
         tags = list(set(w.lower() for w in words[:8]))
         return summary, tags
 
+    # ── Chunking with word-boundary overlap ────────────────────────
+
     def chunk(self, text: str, chunk_size: int = _CHUNK_SIZE,
               overlap: int = _CHUNK_OVERLAP) -> list[str]:
         """Split text into overlapping chunks anchored at sentence boundaries.
 
         Each chunk carries enough context to be semantically meaningful on its own.
-        Uses character-based splitting at sentence boundaries.
+        Overlap happens at word boundaries (not character boundaries) to avoid
+        splitting words in the middle.
         """
         if not text or len(text) <= chunk_size:
             return [text] if text else [""]
 
-        # Split into sentences (simple approach: periods + newlines)
+        # Split into sentences (periods, exclamation, question, newlines)
         sentences = re.split(r'(?<=[.!?])\s+|\n+', text)
         sentences = [s.strip() for s in sentences if s.strip()]
 
@@ -184,7 +287,19 @@ class Indexer:
                 current += " " + sent
             else:
                 chunks.append(current)
-                overlap_text = current[-overlap:] if len(current) > overlap else current
+                # Word-boundary overlap: take N chars from end, then
+                # extend to the next word boundary so we don't split words
+                if len(current) > overlap:
+                    overlap_start = len(current) - overlap
+                    # Find the next word boundary after overlap_start
+                    word_boundary = current.find(' ', overlap_start)
+                    if word_boundary > 0 and word_boundary < len(current):
+                        overlap_text = current[word_boundary + 1:]
+                    else:
+                        # No word boundary found in range, use char boundary
+                        overlap_text = current[overlap_start:]
+                else:
+                    overlap_text = current
                 current = overlap_text + " " + sent
 
         if current:
@@ -192,10 +307,13 @@ class Indexer:
 
         return chunks or [text]
 
+    # ── Full pipeline ───────────────────────────────────────────────
+
     def process_document(self, url: str, raw_html: str, title: str = "",
                          access_group: str = "public",
                          collection: str = "unclassified",
-                         content_hash: str = "") -> list[IndexedChunk]:
+                         content_hash: str = "",
+                         version: int = 0) -> list[IndexedChunk]:
         """Process a single document through the ETL pipeline."""
         cleaned = self.clean_html(raw_html)
         if not cleaned:

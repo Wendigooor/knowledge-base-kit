@@ -114,10 +114,10 @@ def sync(dry_run: bool):
     console.print(f"  Targets: {len(targets)} sources")
     console.print(f"  Dry run: {'yes' if dry_run else 'no'}")
     console.print()
-
     total_new = 0
     total_skipped = 0
     total_chunks = 0
+    total_orphans = 0
 
     for t in targets:
         source_type = t.get("type", "unknown")
@@ -137,39 +137,79 @@ def sync(dry_run: bool):
                 filter_query=t.get("filter_query", ""),
                 access_group=t.get("access_group", "public"),
             )
-            pages = connector.process_target(target)
 
-            if not pages:
-                console.print(f"  [dim]No new/changed documents[/dim]")
-                continue
+            # Acquire state lock for the entire sync run
+            if not state.acquire_lock(blocking=False):
+                console.print("[red]❌ Another sync is running. Try again later.[/red]")
+                return
 
-            console.print(f"  Found {len(pages)} new/changed documents")
+            try:
+                # --- Orphan reconciliation ---
+                # Fetch all current URLs from Confluence, compare with state tracker
+                # Remove chunks for pages that no longer exist in the allowlist
+                known_urls = connector.list_known_urls(target)
+                tracked_urls = state.all_urls()
+                orphan_urls = [
+                    u for u in tracked_urls
+                    if target.location in u and u not in known_urls
+                ]
 
-            for page in pages:
-                if dry_run:
-                    console.print(f"  [dim]📄 Would index: {page['title']}[/dim]")
-                    total_new += 1
+                if orphan_urls:
+                    console.print(f"  Found {len(orphan_urls)} orphaned documents (deleted from Confluence)")
+                    for orphan_url in orphan_urls:
+                        if not dry_run:
+                            chunk_ids = state.get_chunk_ids(orphan_url)
+                            if chunk_ids:
+                                store.delete_chunks(chunk_ids, collection=location.lower())
+                            state.remove(orphan_url)
+                            total_orphans += 1
+                            if dry_run:
+                                console.print(f"  [dim]🗑️ Would remove orphan: {orphan_url}[/dim]")
+                            else:
+                                console.print(f"  [dim]🗑️ Removed orphan: {orphan_url}[/dim]")
+
+                # --- Process new/changed pages ---
+                pages = connector.process_target(target)
+
+                if not pages:
+                    if not orphan_urls:
+                        console.print(f"  [dim]No new/changed documents[/dim]")
+
                     continue
 
-                with Progress(
-                    SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
-                    console=console, transient=True,
-                ) as progress:
-                    progress.add_task(f"  Indexing: {page['title'][:50]}...", total=None)
-                    chunks = indexer.process_document(
-                        url=page["url"],
-                        raw_html=page["body"],
-                        title=page["title"],
-                        access_group=page.get("access_group", "public"),
-                        collection=location.lower(),
-                        content_hash=page["content_hash"],
-                    )
-                    state.mark_indexed(page["url"], page["content_hash"], [c.id for c in chunks])
-                    total_chunks += len(chunks)
-                    total_new += 1
+                console.print(f"  Found {len(pages)} new/changed documents")
 
-            if not dry_run:
-                console.print(f"  [green]✅ {len(pages)} indexed → {total_chunks} chunks[/green]")
+                for page in pages:
+                    if dry_run:
+                        console.print(f"  [dim]📄 Would index: {page['title']}[/dim]")
+                        total_new += 1
+                        continue
+
+                    with Progress(
+                        SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+                        console=console, transient=True,
+                    ) as progress:
+                        progress.add_task(f"  Indexing: {page['title'][:50]}...", total=None)
+                        chunks = indexer.process_document(
+                            url=page["url"],
+                            raw_html=page["body"],
+                            title=page["title"],
+                            access_group=page.get("access_group", "public"),
+                            collection=location.lower(),
+                            content_hash=page["content_hash"],
+                            version=page.get("version", 0),
+                        )
+                        state.mark_indexed(page["url"], page["content_hash"], [c.id for c in chunks])
+                        total_chunks += len(chunks)
+                        total_new += 1
+
+                if not dry_run:
+                    console.print(f"  [green]✅ {len(pages)} indexed → {total_chunks} chunks[/green]")
+                    if total_orphans > 0:
+                        console.print(f"  [yellow]🗑️ {total_orphans} orphans removed[/yellow]")
+
+            finally:
+                state.release_lock()
 
         elif source_type == "gitlab":
             console.print("  [dim]GitLab connector: coming in v0.3[/dim]")
