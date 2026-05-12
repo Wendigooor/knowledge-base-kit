@@ -1,6 +1,7 @@
 """ChromaDB-backed store for KBK v0.2."""
 from __future__ import annotations
 import json
+import logging
 from pathlib import Path
 from typing import Optional
 
@@ -10,6 +11,8 @@ from chromadb.config import Settings
 from kbk.config import KBKConfig
 from kbk.models import IndexedChunk
 from kbk.exceptions import StoreError
+
+logger = logging.getLogger("kbk.store")
 
 WhereFilter = dict
 
@@ -64,18 +67,25 @@ class KnowledgeStore:
         try:
             col = self._get_collection(collection)
             col.delete(ids=chunk_ids)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("ChromaDB delete failed for %d chunks in %s: %s",
+                           len(chunk_ids), collection, exc)
 
     def search(self, query: str, n_results: Optional[int] = None,
                collection_filter: Optional[str] = None,
-               filters: Optional[dict] = None) -> list[IndexedChunk]:
+               filters: Optional[dict] = None,
+               access_group: Optional[str] = None) -> list[IndexedChunk]:
         n_results = n_results or self.config.top_k
         col_name = collection_filter or self.config.default_collection
         col = self._get_collection(col_name)
         where = None
-        if filters:
-            where = {k: {"$eq": v} if isinstance(v, str) else v for k, v in filters.items()}
+        if filters or access_group:
+            where = {}
+            if filters:
+                where.update(filters)
+            if access_group:
+                # Enforce access group filter
+                where["access_group"] = {"$eq": access_group}
         try:
             results = col.query(query_texts=[query], n_results=n_results, where=where)
         except Exception as exc:

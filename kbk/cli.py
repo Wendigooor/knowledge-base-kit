@@ -27,8 +27,14 @@ def _handle_error(func):
     def wrapper(*args, **kwargs):
         try:
             return func(*args, **kwargs)
-        except (StoreError, Exception) as e:
-            console.print(f"[red]❌[/red] {e}")
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Interrupted by user[/yellow]")
+            sys.exit(130)
+        except StoreError as e:
+            console.print(f"[red]❌ Store error: {e}[/red]")
+            sys.exit(1)
+        except Exception as e:
+            console.print(f"[red]❌ {e}[/red]")
             sys.exit(1)
     return wrapper
 

@@ -3,14 +3,19 @@
 Creates a single attractive index page with summaries and links to originals.
 """
 from __future__ import annotations
+import html
 import json
+import logging
 import base64
+import urllib.parse
 import urllib.request
 from datetime import datetime
 from typing import Optional
 
 from kbk.store import KnowledgeStore
 from kbk.config import KBKConfig
+
+logger = logging.getLogger("kbk.showcase")
 
 
 class ShowcaseBuilder:
@@ -39,8 +44,12 @@ class ShowcaseBuilder:
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 return json.loads(resp.read().decode())
-        except Exception:
-            return None
+        except urllib.error.HTTPError as exc:
+            logger.error("Confluence API error %d %s: %s", exc.code, path, exc.read().decode() if exc.fp else "")
+            raise
+        except Exception as exc:
+            logger.error("Confluence request failed %s %s: %s", method, path, exc)
+            raise
 
     def _generate_storage_format(self, stats: dict) -> str:
         """Generate Confluence Storage Format HTML."""
@@ -79,11 +88,11 @@ class ShowcaseBuilder:
                 tags_html = " ".join(
                     f'<ac:structured-macro ac:name="status">'
                     f'<ac:parameter ac:name="colour">Blue</ac:parameter>'
-                    f'<ac:parameter ac:name="title">{t}</ac:parameter>'
+                    f'<ac:parameter ac:name="title">{html.escape(t)}</ac:parameter>'
                     f'</ac:structured-macro>'
                     for t in c.tags[:5]
                 )
-                summary = c.summary[:200] + "..." if len(c.summary) > 200 else c.summary
+                summary = html.escape(c.summary[:200] + "..." if len(c.summary) > 200 else c.summary)
                 link = f'<a href="{c.source_url}">🔗 Original</a>' if c.source_url else ""
                 sections.append(
                     f'<tr><td><strong>{summary}</strong><br/>{tags_html}</td>'

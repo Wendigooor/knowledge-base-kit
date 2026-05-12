@@ -8,15 +8,20 @@
 - Git (код, комментарии к MR)
 - Slack (обсуждения, решения)
 
-KBK — это **семантический индекс** над всеми этими источниками. Он слушает изменения, индексирует, классифицирует и предоставляет единую точку поиска.
+KBK — это **семантический индекс** над всеми этими источниками. Он ходит по белому списку (Allowlist), забирает только нужное, индексирует, классифицирует и предоставляет единую точку поиска. Без вебхуков — только Pull по команде `kbk sync`.
 
 ```
-Confluence ──┐
-Jira ────────┤──→ [Connectors] ──→ [LLM Cleaner] ──→ [Embeddings] ──→ [ChromaDB]
-Git ─────────┤                                              │
-Slack ───────┘                                              ▼
-                                              [Read-Only Confluence Space]
-                                              (авто-генерируемая витрина)
+[Confluence] ──────┐
+[Jira] ────────────┤─── kbk sync ──── [StateTracker] ─── [Indexer] ──→ [ChromaDB]
+[Git] ─────────────┤       │                                  │
+[Slack] ───────────┘       ├─ SHA-256 diff (skip unchanged)    ├─ clean HTML
+                            └─ delete orphans                  ├─ LLM summarize + classify
+                                                               ├─ chunk (1k tokens)
+                                                               └─ embed
+                                                                      │
+                                                                      ▼
+                                                      [Read-Only Confluence Space]
+                                                      (авто-генерируемая витрина)
 ```
 
 ## Ключевые отличия от v1
@@ -26,7 +31,7 @@ Slack ───────┘                                              ▼
 | Хранилище | ChromaDB + Git (JSON) | ChromaDB + connectors |
 | Source of Truth | KBK сам | Confluence/Jira/Git — оригиналы |
 | Версионирование | snapshot-based | В оригиналах (git history, Confluence history) |
-| Sync | git push/pull | Webhooks + cron |
+| Sync | git push/pull | Pull по белым спискам (allowlist + kbk sync) |
 | Документ | Полный content + версии | Summary (LLM) + source_url + tags |
 | CLI | 9 команд (sync, history, rollback) | 5 команд (index, search, status, connectors, explore) |
 | Генерация документации | Нет | Read-Only Confluence space |
@@ -39,13 +44,13 @@ Slack ───────┘                                              ▼
 connectors/
 ├── __init__.py
 ├── base.py           # AbstractConnector
-├── confluence.py     # Confluence REST API → webhooks
-├── jira.py           # Jira REST API → webhooks
-├── gitlab.py         # GitLab webhooks
-└── slack.py          # Slack events API
+├── confluence.py     # Confluence REST API → Pull по allowlist
+├── jira.py           # Jira REST API → Pull по allowlist
+├── gitlab.py         # GitLab API → Pull по allowlist
+└── slack.py          # Slack API → Pull по allowlist
 ```
 
-Каждый коннектор слушает webhook'и или ходит по расписанию (cron).
+Каждый коннектор выполняет Pull по белому списку (Allowlist) из `targets.yaml`.
 При изменении документа:
 1. Получает сырой контент
 2. Отдаёт в `indexer.py` для обработки

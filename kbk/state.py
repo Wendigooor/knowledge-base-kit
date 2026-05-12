@@ -2,8 +2,14 @@
 from __future__ import annotations
 import json
 import hashlib
+import logging
+import shutil
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger("kbk.state")
+
+_DEFAULT_INDENT = 2
 
 
 class StateTracker:
@@ -11,30 +17,48 @@ class StateTracker:
 
     Each source document is identified by its URL.
     If the SHA-256 hash matches the stored hash, the document is skipped.
+
+    Uses atomic write (temp file + replace) to prevent corruption.
+    Backs up corrupt state files before resetting.
     """
 
     def __init__(self, state_path: str):
         self.path = Path(state_path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._data: dict[str, dict] = {}
+        self._dirty = False  # Track unsaved changes for batch mode
         self._load()
 
     def _load(self):
         if self.path.exists():
             try:
                 self._data = json.loads(self.path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
+            except (json.JSONDecodeError, OSError) as exc:
+                logger.warning("Corrupt state file %s: %s. Resetting.", self.path, exc)
+                backup = self.path.with_suffix(".corrupt.bak")
+                try:
+                    shutil.copy2(self.path, backup)
+                    logger.warning("Backup saved to %s", backup)
+                except OSError:
+                    logger.warning("Could not back up corrupt state file.")
                 self._data = {}
+        else:
+            self._data = {}
 
     def _save(self):
-        self.path.write_text(
-            json.dumps(self._data, indent=2, ensure_ascii=False),
+        """Atomic write: write to temp file, then rename."""
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps(self._data, indent=_DEFAULT_INDENT, ensure_ascii=False),
             encoding="utf-8",
         )
+        # Atomic replace (POSIX atomic on same filesystem)
+        tmp.replace(self.path)
+        self._dirty = False
 
     def has_changed(self, url: str, content_hash: str) -> bool:
         """Check if a document has changed since last index.
-        
+
         Returns True if the document should be (re)indexed.
         """
         existing = self._data.get(url)
@@ -48,12 +72,19 @@ class StateTracker:
             "hash": content_hash,
             "chunk_ids": chunk_ids or [],
         }
+        self._dirty = True
         self._save()
 
     def remove(self, url: str):
         """Remove a document from the tracker (e.g., if deleted at source)."""
         self._data.pop(url, None)
+        self._dirty = True
         self._save()
+
+    def batch_save(self):
+        """Explicit final save after batch operations."""
+        if self._dirty:
+            self._save()
 
     def get_chunk_ids(self, url: str) -> list[str]:
         """Get stored chunk IDs for a document."""

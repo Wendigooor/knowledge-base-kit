@@ -1,7 +1,6 @@
 """Configuration for KBK v0.2."""
 from __future__ import annotations
 import os
-import yaml
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional

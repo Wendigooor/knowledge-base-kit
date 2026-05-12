@@ -1,31 +1,26 @@
-"""Custom exceptions for Knowledge Base Kit."""
-
+"""KBK exceptions."""
 from __future__ import annotations
 
 
 class KBKError(Exception):
-    """Base exception for all KBK errors."""
-
-
-class DocumentError(KBKError):
-    """Raised on document-related errors (validation, not found, etc.)."""
+    """Base error for KBK."""
 
 
 class StoreError(KBKError):
-    """Raised on storage-level errors (ChromaDB failures, connection issues)."""
+    """ChromaDB operation failed."""
 
 
-class VersioningError(KBKError):
-    """Raised on version-related errors (missing snapshot, corrupt history)."""
+class ConnectorError(KBKError):
+    """Connector (Confluence/GitLab) operation failed."""
 
 
-class SyncError(KBKError):
-    """Raised on synchronisation errors (git failure, merge conflict)."""
+class LLMError(KBKError):
+    """LLM API call failed (auth, rate limit, or network)."""
 
 
-class ConfigError(KBKError):
-    """Raised on configuration loading/validation errors."""
+class AuthenticationError(KBKError):
+    """API key or token is invalid/missing."""
 
 
-class ConflictError(SyncError):
-    """Raised when a synchronisation conflict cannot be auto-resolved."""
+class ConfigurationError(KBKError):
+    """Config file is invalid or missing required field."""

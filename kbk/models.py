@@ -31,11 +31,12 @@ class IndexedChunk:
 
     def __post_init__(self):
         if not self.id and self.source_url:
-            raw = f"{self.source_url}:{self.content_hash or self.updated_at}"
+            raw = f"{self.source_url}:{self.content_hash}:{self.collection}"
             self.id = hashlib.sha256(raw.encode()).hexdigest()[:16]
         if not self.id:
+            # Fallback: deterministic from source_url + collection
             self.id = hashlib.sha256(
-                f"{datetime.now(timezone.utc).isoformat()}:{id(self)}".encode()
+                f"{self.source_url}:{self.collection}".encode()
             ).hexdigest()[:16]
 
     def to_dict(self) -> dict:

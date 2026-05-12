@@ -4,12 +4,16 @@ Implements the Model Context Protocol (stdio transport).
 Tools: search_knowledge, get_document_summary, list_collections.
 """
 from __future__ import annotations
+import html
 import json
+import logging
 import sys
 from typing import Any
 
 from kbk.store import KnowledgeStore
 from kbk.config import KBKConfig
+
+logger = logging.getLogger("kbk.mcp")
 
 
 class KBKMCPServer:
@@ -47,14 +51,19 @@ class KBKMCPServer:
     def _handle_search(self, params: dict) -> dict:
         query = params.get("query", "")
         collection = params.get("collection")
-        limit = params.get("limit", 10)
-        results = self.store.search(query, n_results=limit, collection_filter=collection)
+        limit = min(params.get("limit", 10), 50)  # cap results
+        # Optionally restrict by access_group
+        access_group = params.get("access_group")
+        results = self.store.search(
+            query, n_results=limit, collection_filter=collection,
+            access_group=access_group,
+        )
         return {
             "results": [
                 {
                     "id": c.id,
                     "source_url": c.source_url,
-                    "content": c.content[:500],
+                    "content": html.escape(c.content[:500]),
                     "summary": c.summary,
                     "tags": c.tags,
                     "access_group": c.access_group,
@@ -66,7 +75,7 @@ class KBKMCPServer:
 
     def _handle_summary(self, params: dict) -> dict:
         collection = params.get("collection", "default")
-        limit = params.get("limit", 20)
+        limit = min(params.get("limit", 20), 100)
         chunks = self.store.list_chunks(collection=collection, limit=limit)
         return {
             "documents": [
@@ -75,6 +84,7 @@ class KBKMCPServer:
                     "source_url": c.source_url,
                     "summary": c.summary,
                     "tags": c.tags,
+                    "access_group": c.access_group,
                 }
                 for c in chunks
             ],
@@ -86,7 +96,6 @@ class KBKMCPServer:
 
     def run(self):
         """Main MCP event loop. Reads JSON-RPC from stdin, writes to stdout."""
-        import sys
         # Send initialize response
         self._send_response(None, {
             "protocolVersion": "2025-03-26",
@@ -100,6 +109,7 @@ class KBKMCPServer:
                                 "query": {"type": "string", "description": "Search query"},
                                 "collection": {"type": "string", "description": "Filter by collection"},
                                 "limit": {"type": "integer", "description": "Max results"},
+                                "access_group": {"type": "string", "description": "Filter by access group"},
                             },
                             "required": ["query"],
                         },
@@ -144,8 +154,12 @@ class KBKMCPServer:
                 if handler:
                     try:
                         result = handler(tool_args)
-                        self._send_response(req_id, {"content": [{"type": "text", "text": json.dumps(result, indent=2)}]})
+                        self._send_response(
+                            req_id,
+                            {"content": [{"type": "text", "text": json.dumps(result, indent=2)}]},
+                        )
                     except Exception as e:
+                        logger.exception("MCP tool %s failed", tool_name)
                         self._send_response(req_id, error=str(e))
                 else:
                     self._send_response(req_id, error=f"Unknown tool: {tool_name}")
