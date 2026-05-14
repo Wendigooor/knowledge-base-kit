@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed · 2026-05-14
+Proposed · 2026-05-14 · Revised after GLM-5.1 + Kimi K2.6 review
 
 ## Context
 
@@ -17,11 +17,7 @@ Current problems:
 
 ## Decision
 
-Build v0.3 as a **demonstrable knowledge loop** — not more features, but a presentable story:
-
-1. **Sources** → 2. **Sync** → 3. **Index** → 4. **MemoryBank** → 5. **Consumption** → 6. **Showcase**
-
-Every block must have a 2-minute demo path.
+Build v0.3 as a **demonstrable knowledge loop** — not more features, but a presentable story.
 
 ## Architecture
 
@@ -33,29 +29,28 @@ flowchart LR
         G["GitLab\n(next)"]
     end
 
-    subgraph Ingestion["⬇️ Ingestion Layer"]
+    subgraph Ingestion["⬇️ Ingestion"]
         T["targets.yaml\nallowlist"]
         S["StateTracker\nSHA-256 diff"]
     end
 
-    subgraph Indexing["🧠 Indexing Layer"]
+    subgraph Indexing["🧠 Indexing"]
         CL["Clean text"]
         L["LLM summarize\n+ classify"]
-        CH["Chunk"]
-        E["Embeddings"]
+        CH["Chunk + Embed"]
     end
 
-    subgraph MemoryBank["💾 MemoryBank"]
+    subgraph Storage["💾 Storage"]
         DB["ChromaDB\nsemantic index"]
         COLL["Collections:\narch · runbooks\norg · decisions"]
     end
 
-    subgraph Consumption["🔌 Consumption Layer"]
+    subgraph API["🔌 API Layer"]
+        GW["Retrieval API\n(authz, observability)"]
         MCP["MCP Server\nfor agents"]
-        API["search_knowledge\nget_document_summary\nlist_collections"]
     end
 
-    subgraph Showcase["👁️ Human Layer"]
+    subgraph UI["👁️ UI Layer"]
         V["KBK Showcase\nread-only view"]
         LINK["↗ link back\nto source"]
     end
@@ -66,12 +61,15 @@ flowchart LR
     T --> S
     S -->|changed| CL
     S -->|unchanged| SKIP["skip"]
-    CL --> L --> CH --> E --> DB
-    DB --> MCP
-    DB --> V
-    MCP --> API
+    CL --> L --> CH --> DB
+    DB --> GW
+    GW --> MCP
+    GW --> V
+    MCP --> A["Agents"]
     V --> LINK
 ```
+
+**Key changes from original v0.3 proposal:** MemoryBank layer collapsed into Storage + API. The retrieval gateway owns authz, observability, and access control — not the MCP server directly.
 
 ## What's New in v0.3 vs v0.2
 
@@ -82,63 +80,56 @@ flowchart LR
 | GitLab connector | ❌ planned | 📐 contract defined |
 | Collections | ⬜ field on chunk | ✅ first-class navigation |
 | MCP tools | search_knowledge, get_document_summary | + list_collections |
+| Authz at retrieval | ❌ allowlist only at ingest | ✅ access_group enforced at query |
+| Observability | ❌ | ✅ trace IDs across layers |
 | Human Showcase | exists | ✅ demo-ready, source-linked |
 | Agent→answer→source trail | ❌ | ✅ demo scenario |
-| 5-minute stakeholder demo | ❌ | ✅ scripted |
+| 5-minute stakeholder demo | ❌ | ✅ scripted (3 tracks) |
+
+## AuthZ Model
+
+**Ingestion-time:** `access_group` from targets.yaml propagates to each chunk as metadata.
+
+**Retrieval-time:** The API layer enforces: if agent/user lacks `access_group` for a chunk, it's excluded from results. The MCP server authenticates the caller and passes their group membership.
+
+This prevents the "HR salaries" leakage scenario without implementing a full ACL matrix in v0.3.
+
+## Observability
+
+Each retrieval request carries a trace ID that spans:
+```
+agent request → API gateway → ChromaDB query → chunk → source URL
+```
+
+If an agent retrieves a bad chunk, operators trace it back to the Confluence page, chunk, and embedding model version.
 
 ## Demo Requirements
 
-Every block in the architecture must have a visible demo:
+Every block must have a 2-minute demo path. But the full demo is trimmed from 9 minutes to **5 minutes (3 tracks)**:
 
-### 1. Source-to-Index (2 min)
+### Track 1: Why should I care? (2 min)
 ```text
-1. Show a Confluence page
-2. Run `kbk sync` — see it detected as "changed"
-3. Run `kbk status` — see document count increase
-4. Show the summary + tags
+1. Show the Showcase — collections, summaries, source links
+2. Ask an agent a question — it answers with sources
+3. "This is the knowledge loop. Let me show you how it works."
 ```
 
-### 2. Change Propagation (1 min)
+### Track 2: How does it work? (2 min — pre-recorded)
 ```text
-1. Edit the Confluence page
-2. Run `kbk sync --dry-run` — cost preview, 1 document changed
-3. Run `kbk sync` — only the changed doc re-indexed
-4. Show updated summary
+Play pre-recorded video:
+1. Confluence page → kbk sync → index → appears in search
+2. Page edited → kbk sync → only changed doc re-indexed
+3. Agent calls search_knowledge → gets summary + source
 ```
 
-### 3. Agent MCP Retrieval (2 min)
+### Track 3: What's next? (1 min)
 ```text
-1. Agent calls `search_knowledge("how to deploy payment service")`
-2. Returns: summary + source URL + collection
-3. Agent calls `get_document_summary(url)` — detailed context
-4. Agent answers with source citation
+1. "Confluence works today."
+2. "Jira and GitLab follow the same pipeline — connector contract is defined."
+3. "Still reading your docs? Here's where we're heading."
 ```
 
-### 4. Collections Navigation (1 min)
-```text
-1. `list_collections` returns: arch, runbooks, org, decisions
-2. `search_knowledge(q, collection="runbooks")` — scoped result
-3. Showcase shows knowledge organized, not flat
-```
-
-### 5. Human Showcase (2 min)
-```text
-1. Open the Showcase page
-2. See collections as expandable sections
-3. Click a document → see summary + tags
-4. Click source link → original Confluence page
-```
-
-### 6. Roadmap Demo (1 min)
-```text
-1. "This is Confluence — working today"
-2. "Jira and GitLab follow the same pipeline"
-3. Show the connector contract
-```
-
-## Total Demo Time: 9 minutes
-
-Each block is independent. You can show any 3 in a 5-minute slot.
+**Why pre-record Track 2:** Live change propagation and agent retrieval are the most failure-prone parts. A pre-recorded demo never fails. The presenter narrates over it.
 
 ## Boundaries
 
@@ -146,36 +137,37 @@ Each block is independent. You can show any 3 in a 5-minute slot.
 - Replacing Confluence/Jira/GitLab
 - Building an enterprise search engine
 - Full multi-source parity (Jira/GitLab are contract-only)
-- Complex ACL models
-
-**The rule:** if a capability can't be demoed in 2 minutes, it doesn't go into v0.3.
+- Custom embedding model training
+- Real-time sync (webhooks are post-v0.3)
 
 ## Consequences
 
 **Good:**
 - Stakeholders see value without reading code
-- Collections make the index navigable, not a black box
-- Agent→source trail proves the system works
-- Each demo block is independently useful
+- AuthZ at ingestion + retrieval prevents data leakage
+- Trace IDs make debugging possible
+- 5-min demo fits any presentation slot
 
 **Risks:**
-- Demo-focus may tempt shortcuts in non-demo paths
-- Jira/GitLab connectors risk being perpetually "next"
-- Showcase needs maintenance to stay in sync
+- ChromaDB may not scale to millions of vectors (acknowledged — Indexing layer abstracts the DB, swappable to Pinecone/Qdrant later)
+- Confluence chunking needs metadata enrichment (page title, space key) to avoid precision loss
+- MCP ecosystem is new — agents that don't support MCP need a REST bridge
 
 ## Decision Drivers
 
 1. Stakeholder demo readiness (highest priority)
-2. Agent retrieval with source citation
-3. Collection-based knowledge navigation
-4. Human-readable knowledge view
-5. Clear roadmap for multi-source expansion
+2. AuthZ at retrieval (enterprise requirement)
+3. Agent retrieval with source citation
+4. Collection-based navigation
+5. Observability for debugging
+6. Clear multi-source roadmap
 
 ## Rejected Alternatives
 
 1. **Build Jira connector first** — would take weeks, no demo value until complete
 2. **Replace ChromaDB with Qdrant/Milvus** — infrastructure change with zero visible impact
-3. **Full ACL implementation** — important but undemoable; deferred to v0.4
+3. **Real-time sync via webhooks** — complex, undemoable, deferred to v0.4
+4. **Separate MemoryBank abstraction** — collapsed into Storage + API after review feedback
 
 ## Phases
 
@@ -183,7 +175,7 @@ Each block is independent. You can show any 3 in a 5-minute slot.
 |-------|-------|------|
 | P1 | Stabilize Confluence baseline | Source→Index |
 | P2 | Collections + curated slices | List, scope, navigate |
-| P3 | Connector contract | Roadmap clarity |
-| P4 | MCP-first agent patterns | Agent→answer→source |
+| P3 | AuthZ at retrieval | Access-group query |
+| P4 | MCP + observability | Trace agent→source |
 | P5 | Human Showcase polish | Non-engineer demo |
-| P6 | End-to-end demo story | 9-minute full walkthrough |
+| P6 | End-to-end demo story | 5-minute walkthrough |
