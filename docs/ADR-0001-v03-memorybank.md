@@ -23,36 +23,36 @@ Build v0.3 as a **demonstrable knowledge loop** — not more features, but a pre
 
 ```mermaid
 flowchart LR
-    subgraph Sources["📦 Sources"]
-        C["Confluence\n(working)"] 
-        J["Jira\n(next)"]
-        G["GitLab\n(next)"]
+    subgraph Sources["Sources"]
+        C["Confluence"]
+        J["Jira"]
+        G["GitLab"]
     end
 
-    subgraph Ingestion["⬇️ Ingestion"]
-        T["targets.yaml\nallowlist"]
-        S["StateTracker\nSHA-256 diff"]
+    subgraph Ingestion["Ingestion"]
+        T["targets.yaml"]
+        S["StateTracker SHA-256"]
     end
 
-    subgraph Indexing["🧠 Indexing"]
+    subgraph Indexing["Indexing"]
         CL["Clean text"]
-        L["LLM summarize\n+ classify"]
+        L["LLM summarize + classify"]
         CH["Chunk + Embed"]
     end
 
-    subgraph Storage["💾 Storage"]
-        DB["ChromaDB\nsemantic index"]
-        COLL["Collections:\narch · runbooks\norg · decisions"]
+    subgraph Storage["Storage"]
+        DB["ChromaDB"]
+        COLL["Collections"]
     end
 
-    subgraph API["🔌 API Layer"]
-        GW["Retrieval API\n(authz, observability)"]
-        MCP["MCP Server\nfor agents"]
+    subgraph API_Layer["API Layer"]
+        GW["Retrieval Gateway"]
+        MCP["MCP Server"]
     end
 
-    subgraph UI["👁️ UI Layer"]
-        V["KBK Showcase\nread-only view"]
-        LINK["↗ link back\nto source"]
+    subgraph UI["UI"]
+        V["Showcase"]
+        LINK["Source link"]
     end
 
     C --> T
